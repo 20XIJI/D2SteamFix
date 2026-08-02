@@ -235,19 +235,38 @@ void require_regular_file(const fs::path& path, const ExitCode code, const char*
     if (!regular) throw AppError(code, stage, missing_detail);
 }
 
-void check_overlay() {
+// Steam injects the renderer into the process it launches from %command%, which is this wrapper.
+// Before protection exists that is expected and harmless: the deny ACE stops destiny2.exe from
+// mapping the DLL later, and an image already loaded here is not inherited by a child process.
+// Afterwards it is a real failure, because it means the ACE did not take.
+enum class OverlayCheck {
+    advisory,
+    fatal,
+};
+
+void check_overlay(const OverlayCheck severity, const Logger& log) {
     try {
         const std::optional<fs::path> loaded = overlay::loaded_renderer();
-        if (loaded) {
-            throw AppError(ExitCode::overlay_loaded, "self overlay check",
-                           "Steam injected " + display_path(*loaded) +
-                           " before protection was established");
+        if (!loaded) return;
+        if (severity == OverlayCheck::advisory) {
+            log.warn("Steam injected " + display_path(*loaded) +
+                     " into the wrapper before protection was established; this does not affect "
+                     "the deny ACE applied to the game");
+            return;
         }
+        throw AppError(ExitCode::overlay_loaded, "self overlay check",
+                       "Steam injected " + display_path(*loaded) +
+                       " after protection was established");
     } catch (const AppError&) {
         throw;
     } catch (const std::exception& error) {
-        throw AppError(ExitCode::overlay_loaded, "self overlay check",
-                       "could not safely enumerate wrapper modules: " + std::string(error.what()));
+        const std::string detail =
+            "could not safely enumerate wrapper modules: " + std::string(error.what());
+        if (severity == OverlayCheck::advisory) {
+            log.warn(detail);
+            return;
+        }
+        throw AppError(ExitCode::overlay_loaded, "self overlay check", detail);
     }
 }
 
@@ -293,7 +312,7 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
     const Invocation invocation = validate_invocation(forwarded, app_id, game_id);
     log.info("validated launcher path: " + display_path(invocation.launcher));
     log.info("relevant App ID: 1085660");
-    check_overlay();
+    check_overlay(OverlayCheck::advisory, log);
 
     std::vector<std::pair<DWORD, std::wstring>> existing;
     try {
@@ -302,7 +321,8 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
         throw AppError(ExitCode::existing_session, "existing-session check", error.what());
     }
     if (!existing.empty()) {
-        throw AppError(ExitCode::existing_session, "existing-session check", existing_processes(existing));
+        throw AppError(ExitCode::existing_session, "existing-session check", existing_processes(existing))
+            .with_guidance(i18n::text(i18n::Msg::destiny_running));
     }
 
     fs::path steam_directory;
@@ -337,7 +357,7 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
     std::exception_ptr session_error;
     std::optional<int> exit_status;
     try {
-        check_overlay();
+        check_overlay(OverlayCheck::fatal, log);
         ChildProcess child = launch(invocation);
         launcher_started = true;
         log.info("launched destiny2launcher.exe; beginning fail-closed process monitoring");
@@ -389,12 +409,16 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
 }
 
 std::wstring failure_message(const AppError& error) {
-    if (!error.guidance().empty()) return error.guidance();
+    // The exit code is what docs/EXIT_CODES.md is indexed by, and what makes a user report
+    // identifiable; show it even when the rest of the text is friendly guidance.
+    const std::wstring code_line =
+        i18n::text(i18n::Msg::error_code) + std::to_wstring(static_cast<int>(error.code()));
+    if (!error.guidance().empty()) return error.guidance() + code_line;
     const std::wstring launch_status = error.launcher_started()
         ? i18n::text(i18n::Msg::launcher_started) : i18n::text(i18n::Msg::game_not_started);
     return i18n::text(i18n::Msg::failure_intro) + widen(error.stage()) +
            i18n::text(i18n::Msg::failure_stage_suffix) + widen(error.detail()) +
-           i18n::text(i18n::Msg::see_log) + launch_status;
+           i18n::text(i18n::Msg::see_log) + launch_status + code_line;
 }
 
 bool validate_app_ids(const std::optional<std::wstring>& app_id,
@@ -417,7 +441,9 @@ Invocation validate_invocation(const std::vector<std::wstring>& args,
     const fs::path raw(args.front());
     if (!paths::name_is(raw, L"destiny2launcher.exe")) {
         throw AppError(ExitCode::validation, "command validation",
-                       "the forwarded executable must be destiny2launcher.exe");
+                       "the forwarded executable must be destiny2launcher.exe, but was " +
+                       display_path(raw.filename()))
+            .with_guidance(i18n::text(i18n::Msg::wrong_forwarded_executable));
     }
     fs::path launcher;
     try {

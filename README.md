@@ -1,5 +1,7 @@
 # D2SteamFix
 
+[简体中文](README.zh-CN.md)
+
 D2SteamFix is a launch wrapper for Destiny 2 intended to help alleviate frame pacing and stuttering issues for Steam users. Before starting Destiny 2, it temporarily denies execute access to Steam's overlay renderer DLLs, then restores the original permissions after exiting the game.
 
 Please note that blocking the Steam Overlay DLLs can also affect overlay-dependent features such as Steam Input, notifications, Game Recording, and Remote Play. This program temporarily changes only the ACL metadata of the overlay DLLs; it does not alter their contents. It does not inject code, inspect process memory, modify game files, change Steam configuration, or bypass BattlEye.
@@ -24,6 +26,28 @@ Replace `C:\path\to\Destiny 2` with the actual location of your Destiny 2 instal
 ```
 
 ![Steam Launch Options](https://static.d2checkpoint.com/steamfix_launch_options.png)
+
+## Verifying it works
+
+Launch Destiny 2 from Steam and press **Shift+Tab** in game. The Steam overlay not appearing means the renderer is blocked and D2SteamFix is doing its job. The overlay returns on its own once the game exits.
+
+D2SteamFix writes `steamfix.log` next to the game executable, in the same folder as `steamfix.exe`. That file is what to attach when reporting a problem; the error dialog also shows an error code that `docs/EXIT_CODES.md` explains.
+
+## If the Steam overlay stays disabled
+
+The renderer permissions are restored when the game exits. If Destiny 2, Steam or the computer stops abruptly, that restore never runs and the overlay stays disabled until D2SteamFix gets another chance.
+
+Double-click `steamfix.exe` once to fix it. Run without a game to launch, it restores the saved permissions, removes its leftover state and then tells you it belongs in Steam's launch options — that message is expected, and the repair has already happened by the time it appears. Close Destiny 2 first: D2SteamFix waits for every Destiny process to exit before touching permissions.
+
+## Removing D2SteamFix
+
+Repair first, then remove — in that order:
+
+1. Double-click `steamfix.exe` once, as described above, so no saved permission state is left behind.
+2. Remove the launch options from Destiny 2's properties in Steam.
+3. Delete `steamfix.exe`, `steamfix.log` and `steamfix.log.old` from the game folder.
+
+Deleting `steamfix.exe` while a `steamfix.dat` file is still beside it leaves the Steam overlay permanently disabled, with nothing left installed to explain why. If that has already happened, put `steamfix.exe` back in the game folder, double-click it once, and then remove both files.
 
 ## Administrator rights
 

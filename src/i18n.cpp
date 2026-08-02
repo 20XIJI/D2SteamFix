@@ -59,6 +59,17 @@ constexpr std::array entries{
     Entry{L":\n\n", L"」阶段失败：\n\n"},
     Entry{L"\n\nSee steamfix.log in the current working directory.\n\n",
           L"\n\n详见当前工作目录下的 steamfix.log。\n\n"},
+    Entry{L"\n\nError code ", L"\n\n错误代码 "},
+    Entry{L"Destiny 2 is already running.\n\nClose the game completely and try again. If it is "
+          L"not visible, end destiny2.exe and destiny2launcher.exe in Task Manager.",
+          L"Destiny 2 已在运行。\n\n请完全关闭游戏后重试。如果界面上看不到游戏，"
+          L"请在任务管理器中结束 destiny2.exe 与 destiny2launcher.exe。"},
+    Entry{L"Steam did not forward a Destiny 2 command to D2SteamFix.\n\nCheck the launch options: "
+          L"steamfix.exe must come before %command%, with the whole path in quotes.\n\n"
+          L"\"C:\\path\\to\\steamfix.exe\" %command%",
+          L"Steam 没有向 D2SteamFix 转发 Destiny 2 的启动命令。\n\n请检查启动选项："
+          L"steamfix.exe 必须写在 %command% 之前，且完整路径需要用引号括起。\n\n"
+          L"\"C:\\路径\\steamfix.exe\" %command%"},
     Entry{L"The Destiny 2 launcher was started.", L"Destiny 2 启动器已启动。"},
     Entry{L"Destiny 2 was not started.", L"Destiny 2 未启动。"},
     Entry{L"D2SteamFix could not format this message.", L"D2SteamFix 无法显示此消息。"},
