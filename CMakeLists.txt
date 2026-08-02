@@ -13,6 +13,8 @@ endif()
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/steamfix.rc.in"
                "${CMAKE_CURRENT_BINARY_DIR}/steamfix.rc" @ONLY)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/steamfix.ico"
+               "${CMAKE_CURRENT_BINARY_DIR}/steamfix.ico" COPYONLY)
 
 add_executable(steamfix WIN32
     src/main.cpp

@@ -1,5 +1,9 @@
 #include <windows.h>
 
+// Lowest-numbered icon resource: this is what Explorer and the taskbar show.
+// CMake copies steamfix.ico next to the generated .rc file.
+1 ICON "steamfix.ico"
+
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
  PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
