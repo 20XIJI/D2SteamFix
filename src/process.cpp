@@ -30,7 +30,10 @@ class ReleaseState {
   public:
     using Clock = std::chrono::steady_clock;
 
-    static constexpr auto launcher_exit_grace = std::chrono::seconds(30);
+    // The launcher can exit before destiny2.exe appears. Releasing protection during that window
+    // silently defeats the whole wrapper: the game starts afterwards and Steam injects the overlay
+    // as usual, with nothing to report. Waiting longer only delays an already-finished session.
+    static constexpr auto launcher_exit_grace = std::chrono::seconds(120);
     static constexpr unsigned exit_debounce_polls = 2;
 
     [[nodiscard]] bool observe(const bool launcher_alive, const bool game_alive,
@@ -59,6 +62,10 @@ class ReleaseState {
         if (absent_polls_ != std::numeric_limits<unsigned>::max()) ++absent_polls_;
         return absent_polls_ >= exit_debounce_polls;
     }
+
+    // False means protection was released on the grace period rather than on watching the game
+    // exit, which is worth recording: it is the shape a silently ineffective session takes.
+    [[nodiscard]] bool game_was_observed() const noexcept { return game_observed_; }
 
   private:
     void reset_negative_observations() noexcept {
@@ -153,7 +160,13 @@ std::vector<std::pair<DWORD, std::wstring>> matching_in_dir(const fs::path& dire
 
 void wait_for_destiny_quiescence(const Logger& log) {
     constexpr auto clean_interval = std::chrono::seconds(30);
+    constexpr auto blocked_limit = std::chrono::seconds(120);
+    // Candidates are matched on name alone. Recovery runs before the command line is parsed, so
+    // there is no game directory to compare against, and any Destiny process may be holding the
+    // renderer this state file describes.
     std::optional<std::chrono::steady_clock::time_point> clear_since;
+    std::optional<std::chrono::steady_clock::time_point> blocked_since;
+    unsigned blocked_polls = 0;
     for (;;) {
         std::optional<ProcessInfo> candidate;
         for (const ProcessInfo& item : snapshot()) {
@@ -165,10 +178,23 @@ void wait_for_destiny_quiescence(const Logger& log) {
         }
         const auto now = std::chrono::steady_clock::now();
         if (candidate) {
-            throw std::runtime_error(
-                "a named Destiny process is still running; close it and retry: pid=" +
-                std::to_string(candidate->pid) + ", name=" + narrow(candidate->name));
+            clear_since.reset();
+            if (!blocked_since) blocked_since = now;
+            if (blocked_polls % 20 == 0) {
+                log.info("pending ACL recovery is waiting for a Destiny process to exit: pid=" +
+                         std::to_string(candidate->pid) + ", name=" + narrow(candidate->name));
+            }
+            increment_saturated(blocked_polls);
+            if (now - *blocked_since >= blocked_limit) {
+                throw std::runtime_error(
+                    "Destiny was still running two minutes after the prompt. Close Destiny 2 "
+                    "completely, or end it in Task Manager if it is not responding, then start the "
+                    "game again. Last seen: " + narrow(candidate->name) + ", pid=" +
+                    std::to_string(candidate->pid));
+            }
         } else {
+            blocked_since.reset();
+            blocked_polls = 0;
             if (!clear_since) {
                 clear_since = now;
                 log.info("pending ACL recovery found no named Destiny process; beginning 30-second "
@@ -321,6 +347,11 @@ std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::
                  std::to_string(child_pid));
     } catch (...) {
         log.info("both Destiny process categories closed");
+    }
+    if (!release.game_was_observed()) {
+        log.warn("released renderer protection without ever observing destiny2.exe: the launcher "
+                 "exited and the grace period elapsed. If the game started after that point, the "
+                 "Steam overlay was not blocked for this session.");
     }
     return child_status;
 }

@@ -483,8 +483,9 @@ int entry() {
         }
         if (recovery_exists) {
             ui::info(L"D2SteamFix found interrupted permission recovery state.\n\n"
-                     L"Close Destiny 2 before continuing. After you select OK, D2SteamFix will "
-                     L"require 30 seconds with no Destiny process before restoring permissions.");
+                     L"Close Destiny 2 before continuing. After you select OK, D2SteamFix waits for "
+                     L"every Destiny process to exit, then requires 30 seconds of quiet before "
+                     L"restoring permissions. It gives up after two minutes of waiting.");
             try {
                 process::wait_for_destiny_quiescence(*log);
             } catch (const std::exception& error) {
