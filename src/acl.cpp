@@ -289,25 +289,39 @@ struct UserIdentity {
     UniqueHandle token;
     std::vector<std::byte> data;
     PSID sid = nullptr;
+    std::vector<std::byte> owner_data;
+    // The SID this token stamps as the owner of objects it creates. Equal to the user SID on a
+    // system with UAC enabled, but not guaranteed to be when token filtering is switched off.
+    PSID owner_sid = nullptr;
 };
+
+std::vector<std::byte> token_information(const HANDLE token, const TOKEN_INFORMATION_CLASS which,
+                                         const size_t minimum, const char* message) {
+    DWORD needed = 0;
+    SetLastError(ERROR_SUCCESS);
+    static_cast<void>(GetTokenInformation(token, which, nullptr, 0, &needed));
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < minimum) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_SUCCESS) throw std::runtime_error(message);
+        throw_win32(error);
+    }
+    std::vector<std::byte> data(needed);
+    if (!GetTokenInformation(token, which, data.data(), needed, &needed)) {
+        throw_win32(GetLastError());
+    }
+    return data;
+}
 
 UserIdentity current_user() {
     HANDLE raw = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) throw_win32(GetLastError());
-    UserIdentity result{UniqueHandle(raw), {}, nullptr};
-    DWORD needed = 0;
-    SetLastError(ERROR_SUCCESS);
-    static_cast<void>(GetTokenInformation(result.token.get(), TokenUser, nullptr, 0, &needed));
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(TOKEN_USER)) {
-        const DWORD error = GetLastError();
-        if (error == ERROR_SUCCESS) throw std::runtime_error("invalid current-user token size");
-        throw_win32(error);
-    }
-    result.data.resize(needed);
-    if (!GetTokenInformation(result.token.get(), TokenUser, result.data.data(), needed, &needed)) {
-        throw_win32(GetLastError());
-    }
+    UserIdentity result{UniqueHandle(raw), {}, nullptr, {}, nullptr};
+    result.data = token_information(result.token.get(), TokenUser, sizeof(TOKEN_USER),
+                                    "invalid current-user token size");
     result.sid = reinterpret_cast<TOKEN_USER*>(result.data.data())->User.Sid;
+    result.owner_data = token_information(result.token.get(), TokenOwner, sizeof(TOKEN_OWNER),
+                                          "invalid current-owner token size");
+    result.owner_sid = reinterpret_cast<TOKEN_OWNER*>(result.owner_data.data())->Owner;
     return result;
 }
 
@@ -354,16 +368,22 @@ private:
     PACL acl_ = nullptr;
 };
 
-void require_current_user_owner(const HANDLE handle, PSID expected_owner) {
+// Accepts either the user SID or the token's own default owner. The two are identical while UAC
+// is enabled, but Windows only documents that guarantee for filtered tokens, and a recovery file
+// this account wrote must stay readable regardless of how the system is configured.
+void require_current_user_owner(const HANDLE handle, PSID expected_user, PSID expected_token_owner) {
     PSID owner = nullptr;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     const DWORD status = GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
                                          &owner, nullptr, nullptr, nullptr, &descriptor);
     if (status != ERROR_SUCCESS) throw_win32(status);
     LocalMemory memory(descriptor);
-    if (owner == nullptr || !EqualSid(owner, expected_owner)) {
-        throw std::runtime_error("recovery storage is not owned by the current Windows user");
+    if (owner == nullptr) {
+        throw std::runtime_error("recovery storage has no owner");
     }
+    if (EqualSid(owner, expected_user)) return;
+    if (expected_token_owner != nullptr && EqualSid(owner, expected_token_owner)) return;
+    throw std::runtime_error("recovery storage is not owned by the current Windows user");
 }
 
 HANDLE open_access_raw(const fs::path& path, const DWORD access) {
@@ -821,7 +841,7 @@ std::vector<RecoveryEntry> read_state(const fs::path& path) {
         throw std::runtime_error("recovery state is not a regular, non-reparse file");
     }
     UserIdentity identity = current_user();
-    require_current_user_owner(file.get(), identity.sid);
+    require_current_user_owner(file.get(), identity.sid, identity.owner_sid);
     RestrictedSecurity security(identity.sid, 0);
     const DWORD acl_status = SetSecurityInfo(
         file.get(), SE_FILE_OBJECT,

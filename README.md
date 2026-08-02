@@ -25,6 +25,14 @@ Replace `C:\path\to\Destiny 2` with the actual location of your Destiny 2 instal
 
 ![Steam Launch Options](https://static.d2checkpoint.com/steamfix_launch_options.png)
 
+## Administrator rights
+
+D2SteamFix refuses to run with an elevated token, because it would then launch Destiny 2 elevated as well. It never requests elevation itself — its manifest declares `asInvoker` — so when it reports one, the token was inherited from whatever started it.
+
+The usual cause is Steam carrying a compatibility flag. Right-click `steam.exe`, select **Properties** → **Compatibility**, clear **Run this program as an administrator** (also under **Change settings for all users**), then restart Steam. The failure message names the process the token came from.
+
+Systems with User Account Control switched off entirely (`EnableLUA=0`), and the built-in Administrator account, are a different case: every process already runs with a full administrator token and there is nothing to drop. D2SteamFix continues in that situation and records a warning in `steamfix.log`.
+
 ## Building from Source
 
 ### Prerequisites

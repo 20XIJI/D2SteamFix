@@ -117,19 +117,109 @@ UniqueHandle session_mutex() {
     return handle;
 }
 
-bool process_is_elevated() {
+enum class Elevation {
+    // Either a limited (UAC-filtered) token or a plain standard-user token.
+    none,
+    // An unfiltered administrator token that the user cannot opt out of: UAC is disabled
+    // machine-wide (EnableLUA=0), or this is the built-in Administrator account running with
+    // FilterAdministratorToken=0. Refusing here would leave no way to run the wrapper at all.
+    unfiltered_admin,
+    // A genuinely elevated token. The manifest requests asInvoker, so this can only have come
+    // from the launching process or a "run as administrator" compatibility layer.
+    elevated,
+};
+
+bool token_reports_elevated(const HANDLE token) {
+    TOKEN_ELEVATION elevation{};
+    DWORD returned = 0;
+    if (!GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &returned)) {
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
+    }
+    if (returned != sizeof(elevation)) throw std::runtime_error("invalid token-elevation result size");
+    return elevation.TokenIsElevated != 0;
+}
+
+Elevation process_elevation() {
     HANDLE raw = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) {
         throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
     }
     const UniqueHandle token(raw);
-    TOKEN_ELEVATION elevation{};
+    TOKEN_ELEVATION_TYPE type{};
     DWORD returned = 0;
-    if (!GetTokenInformation(token.get(), TokenElevation, &elevation, sizeof(elevation), &returned)) {
+    if (!GetTokenInformation(token.get(), TokenElevationType, &type, sizeof(type), &returned)) {
         throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
     }
-    if (returned != sizeof(elevation)) throw std::runtime_error("invalid token-elevation result size");
-    return elevation.TokenIsElevated != 0;
+    if (returned != sizeof(type)) throw std::runtime_error("invalid token-elevation-type result size");
+    if (type == TokenElevationTypeFull) return Elevation::elevated;
+    if (type == TokenElevationTypeLimited) return Elevation::none;
+    // TokenElevationTypeDefault covers both a standard user and an administrator on a system
+    // where UAC token filtering is not in effect. Only the latter reports an elevated token.
+    return token_reports_elevated(token.get()) ? Elevation::unfiltered_admin : Elevation::none;
+}
+
+std::string elevation_name(const Elevation value) {
+    switch (value) {
+        case Elevation::none: return "none";
+        case Elevation::unfiltered_admin: return "unfiltered administrator token";
+        case Elevation::elevated: return "elevated";
+    }
+    return "unknown";
+}
+
+struct ParentProcess {
+    DWORD pid;
+    std::wstring name;
+    std::optional<bool> elevated;
+};
+
+// Best-effort identification of the process that launched this one, used only to make the
+// privilege-check failure actionable.
+// ponytail: the pid comes from a Toolhelp32 snapshot and could in principle name a recycled
+// process; acceptable for diagnostic text, revisit if it ever drives a decision.
+std::optional<ParentProcess> immediate_parent() {
+    try {
+        const std::vector<DWORD> chain = process::parent_chain();
+        if (chain.empty()) return std::nullopt;
+        const DWORD pid = chain.front();
+        const UniqueHandle handle(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
+        ParentProcess parent{pid, process::image_path(handle.get()).filename().native(), std::nullopt};
+        try {
+            HANDLE raw = nullptr;
+            if (!OpenProcessToken(handle.get(), TOKEN_QUERY, &raw)) {
+                throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
+            }
+            const UniqueHandle token(raw);
+            parent.elevated = token_reports_elevated(token.get());
+        } catch (const std::exception&) {
+            // Leave the elevation unknown; the caller falls back to naming both candidates.
+        }
+        return parent;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::string elevated_detail() {
+    std::string detail =
+        "D2SteamFix is running with an administrator token. It never requests one: its manifest "
+        "declares asInvoker, so the elevated token came from whatever started it.\n\n";
+    const std::optional<ParentProcess> parent = immediate_parent();
+    if (parent && parent->elevated.value_or(false)) {
+        detail += "The token was inherited from " + narrow(parent->name) + " (pid " +
+                  std::to_string(parent->pid) + ").\n\nRight-click " + narrow(parent->name) +
+                  " -> Properties -> Compatibility, clear \"Run this program as an administrator\" "
+                  "(check \"Change settings for all users\" as well), then restart it.";
+        return detail;
+    }
+    if (parent) {
+        detail += "It was started by " + narrow(parent->name) + " (pid " +
+                  std::to_string(parent->pid) + "), which does not appear to be elevated itself.\n\n";
+    }
+    detail += "Right-click steamfix.exe and Steam -> Properties -> Compatibility, clear \"Run this "
+              "program as an administrator\" on both (check \"Change settings for all users\" as "
+              "well), then restart Steam.";
+    return detail;
 }
 
 void require_regular_file(const fs::path& path, const ExitCode code, const char* stage,
@@ -383,10 +473,6 @@ int entry() {
     try {
         const std::vector<std::wstring> forwarded = command_line_arguments();
         const UniqueHandle mutex = session_mutex();
-        if (process_is_elevated()) {
-            throw AppError(ExitCode::validation, "privilege check",
-                           "D2SteamFix must not run as administrator; launch Steam and D2SteamFix normally");
-        }
         const fs::path recovery = acl::recovery_path(cwd);
         log->info("ACL recovery state path: " + display_path(recovery));
         std::error_code recovery_error;
@@ -408,10 +494,28 @@ int entry() {
             }
         }
         const bool recovered = acl::recover_pending(recovery, *log);
-        if (recovered && forwarded.empty()) {
+        // Reported before the privilege gate: someone who double-clicks steamfix.exe (elevated or
+        // not) needs to be told it belongs in Steam's launch options, not about their token.
+        if (forwarded.empty()) {
+            const std::wstring prefix =
+                recovered ? L"D2SteamFix restored renderer permissions left by an interrupted session.\n\n"
+                          : L"";
             throw AppError(ExitCode::invalid_invocation, "invalid invocation",
-                           narrow(L"D2SteamFix restored renderer permissions left by an interrupted session.\n\n") +
-                           narrow(invalid_message));
+                           narrow(prefix) + narrow(invalid_message));
+        }
+        const Elevation elevation = process_elevation();
+        log->info("token elevation: " + elevation_name(elevation));
+        switch (elevation) {
+            case Elevation::none:
+                break;
+            case Elevation::unfiltered_admin:
+                log->warn("UAC token filtering is not in effect on this system (UAC disabled, or the "
+                          "built-in Administrator account); every process of this account runs with a "
+                          "full administrator token, so refusing would not lower the game's privileges. "
+                          "Continuing.");
+                break;
+            case Elevation::elevated:
+                throw AppError(ExitCode::validation, "privilege check", elevated_detail());
         }
         const int code = run(*log, forwarded, recovery);
         log->info("final exit status: " + std::to_string(code));
