@@ -3,6 +3,7 @@
 #include "steamfix/acl.hpp"
 #include "steamfix/command_line.hpp"
 #include "steamfix/error.hpp"
+#include "steamfix/i18n.hpp"
 #include "steamfix/logging.hpp"
 #include "steamfix/overlay.hpp"
 #include "steamfix/paths.hpp"
@@ -26,11 +27,6 @@ namespace fs = std::filesystem;
 
 namespace steamfix::app {
 namespace {
-
-constexpr wchar_t invalid_message[] =
-    L"D2SteamFix was not started by Steam with a Destiny 2 command.\n\n"
-    L"This program must be run from Steam using launch options:\n"
-    L"\"C:\\path\\to\\steamfix.exe\" %command%\n\nDestiny 2 was not started.";
 
 struct Invocation {
     fs::path launcher;
@@ -200,26 +196,33 @@ std::optional<ParentProcess> immediate_parent() {
     }
 }
 
-std::string elevated_detail() {
-    std::string detail =
-        "D2SteamFix is running with an administrator token. It never requests one: its manifest "
-        "declares asInvoker, so the elevated token came from whatever started it.\n\n";
+struct ElevationReport {
+    // English, and the only half that reaches the log.
+    std::string detail;
+    // The user's language, shown in the message box.
+    std::wstring guidance;
+};
+
+ElevationReport elevated_report() {
     const std::optional<ParentProcess> parent = immediate_parent();
-    if (parent && parent->elevated.value_or(false)) {
-        detail += "The token was inherited from " + narrow(parent->name) + " (pid " +
-                  std::to_string(parent->pid) + ").\n\nRight-click " + narrow(parent->name) +
-                  " -> Properties -> Compatibility, clear \"Run this program as an administrator\" "
-                  "(check \"Change settings for all users\" as well), then restart it.";
-        return detail;
+    ElevationReport report{
+        "running with an administrator token that was not requested; the manifest declares asInvoker",
+        i18n::text(i18n::Msg::elevated_intro)};
+    if (!parent) {
+        report.guidance += i18n::text(i18n::Msg::elevated_fix_both);
+        return report;
     }
-    if (parent) {
-        detail += "It was started by " + narrow(parent->name) + " (pid " +
-                  std::to_string(parent->pid) + "), which does not appear to be elevated itself.\n\n";
+    const std::wstring source = parent->name + L" (pid " + std::to_wstring(parent->pid) + L")";
+    report.detail += "; launched by " + narrow(source);
+    report.guidance += i18n::text(i18n::Msg::elevated_source) + source;
+    if (parent->elevated.value_or(false)) {
+        report.detail += " which is itself elevated";
+        report.guidance += i18n::text(i18n::Msg::elevated_fix_named);
+    } else {
+        report.detail += " which does not report an elevated token";
+        report.guidance += i18n::text(i18n::Msg::elevated_fix_both);
     }
-    detail += "Right-click steamfix.exe and Steam -> Properties -> Compatibility, clear \"Run this "
-              "program as an administrator\" on both (check \"Change settings for all users\" as "
-              "well), then restart Steam.";
-    return detail;
+    return report;
 }
 
 void require_regular_file(const fs::path& path, const ExitCode code, const char* stage,
@@ -386,11 +389,12 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
 }
 
 std::wstring failure_message(const AppError& error) {
-    if (error.code() == ExitCode::invalid_invocation) return widen(error.detail());
-    const wchar_t* launch_status = error.launcher_started()
-        ? L"The Destiny 2 launcher was started." : L"Destiny 2 was not started.";
-    return L"D2SteamFix failed during " + widen(error.stage()) + L":\n\n" + widen(error.detail()) +
-           L"\n\nSee steamfix.log in the current working directory.\n\n" + launch_status;
+    if (!error.guidance().empty()) return error.guidance();
+    const std::wstring launch_status = error.launcher_started()
+        ? i18n::text(i18n::Msg::launcher_started) : i18n::text(i18n::Msg::game_not_started);
+    return i18n::text(i18n::Msg::failure_intro) + widen(error.stage()) +
+           i18n::text(i18n::Msg::failure_stage_suffix) + widen(error.detail()) +
+           i18n::text(i18n::Msg::see_log) + launch_status;
 }
 
 bool validate_app_ids(const std::optional<std::wstring>& app_id,
@@ -406,7 +410,9 @@ Invocation validate_invocation(const std::vector<std::wstring>& args,
                                const std::optional<std::wstring>& app_id,
                                const std::optional<std::wstring>& game_id) {
     if (args.empty()) {
-        throw AppError(ExitCode::invalid_invocation, "invalid invocation", narrow(invalid_message));
+        throw AppError(ExitCode::invalid_invocation, "invalid invocation",
+                       "no Destiny 2 command was forwarded")
+            .with_guidance(i18n::text(i18n::Msg::invalid_invocation));
     }
     const fs::path raw(args.front());
     if (!paths::name_is(raw, L"destiny2launcher.exe")) {
@@ -447,25 +453,24 @@ int entry() {
     try {
         executable = current_executable();
     } catch (const std::exception& error) {
-        ui::error(L"D2SteamFix could not determine its executable path: " + widen(error.what()) +
-                  L"\n\nDestiny 2 was not started.");
+        ui::error(i18n::text(i18n::Msg::executable_path_failure) + widen(error.what()) + L"\n\n" +
+                  i18n::text(i18n::Msg::game_not_started));
         return static_cast<int>(ExitCode::internal);
     }
     fs::path cwd;
     try {
         cwd = current_directory();
     } catch (const std::exception& error) {
-        ui::error(L"D2SteamFix could not determine the current working directory for its log and "
-                  L"recovery files.\n\n" + widen(error.what()) + L"\n\nDestiny 2 was not started.");
+        ui::error(i18n::text(i18n::Msg::working_directory_failure) + widen(error.what()) + L"\n\n" +
+                  i18n::text(i18n::Msg::game_not_started));
         return static_cast<int>(ExitCode::log_initialization);
     }
     std::unique_ptr<Logger> log;
     try {
         log = std::make_unique<Logger>(cwd / L"steamfix.log");
     } catch (const std::exception& error) {
-        ui::error(L"D2SteamFix could not open steamfix.log in the current working directory. "
-                  L"Ensure the working directory is writable.\n\n" + widen(error.what()) +
-                  L"\n\nDestiny 2 was not started.");
+        ui::error(i18n::text(i18n::Msg::log_open_failure) + widen(error.what()) + L"\n\n" +
+                  i18n::text(i18n::Msg::game_not_started));
         return static_cast<int>(ExitCode::log_initialization);
     }
     log->info("startup; wrapper path: " + display_path(executable) +
@@ -482,10 +487,7 @@ int entry() {
                            display_path(recovery) + ": " + recovery_error.message());
         }
         if (recovery_exists) {
-            ui::info(L"D2SteamFix found interrupted permission recovery state.\n\n"
-                     L"Close Destiny 2 before continuing. After you select OK, D2SteamFix waits for "
-                     L"every Destiny process to exit, then requires 30 seconds of quiet before "
-                     L"restoring permissions. It gives up after two minutes of waiting.");
+            ui::info(i18n::literal(i18n::Msg::recovery_prompt));
             try {
                 process::wait_for_destiny_quiescence(*log);
             } catch (const std::exception& error) {
@@ -499,10 +501,12 @@ int entry() {
         // not) needs to be told it belongs in Steam's launch options, not about their token.
         if (forwarded.empty()) {
             const std::wstring prefix =
-                recovered ? L"D2SteamFix restored renderer permissions left by an interrupted session.\n\n"
-                          : L"";
+                recovered ? i18n::text(i18n::Msg::recovered_prefix) : std::wstring{};
             throw AppError(ExitCode::invalid_invocation, "invalid invocation",
-                           narrow(prefix) + narrow(invalid_message));
+                           recovered ? "restored an interrupted session; no Destiny 2 command "
+                                       "was forwarded"
+                                     : "no Destiny 2 command was forwarded")
+                .with_guidance(prefix + i18n::text(i18n::Msg::invalid_invocation));
         }
         const Elevation elevation = process_elevation();
         log->info("token elevation: " + elevation_name(elevation));
@@ -515,8 +519,11 @@ int entry() {
                           "full administrator token, so refusing would not lower the game's privileges. "
                           "Continuing.");
                 break;
-            case Elevation::elevated:
-                throw AppError(ExitCode::validation, "privilege check", elevated_detail());
+            case Elevation::elevated: {
+                const ElevationReport report = elevated_report();
+                throw AppError(ExitCode::validation, "privilege check", report.detail)
+                    .with_guidance(report.guidance);
+            }
         }
         const int code = run(*log, forwarded, recovery);
         log->info("final exit status: " + std::to_string(code));
@@ -528,13 +535,13 @@ int entry() {
         return static_cast<int>(error.code());
     } catch (const std::exception& error) {
         log->error("unexpected internal failure: " + std::string(error.what()) + "; helper exit code=19");
-        ui::error(L"D2SteamFix encountered an unexpected internal failure.\n\nSee steamfix.log in the "
-                  L"current working directory.\n\nDestiny 2 was not started.");
+        ui::error(i18n::text(i18n::Msg::internal_failure) + i18n::text(i18n::Msg::see_log) +
+                  i18n::text(i18n::Msg::game_not_started));
         return static_cast<int>(ExitCode::internal);
     } catch (...) {
         log->error("unexpected internal failure; helper exit code=19");
-        ui::error(L"D2SteamFix encountered an unexpected internal failure.\n\nSee steamfix.log in the "
-                  L"current working directory.\n\nDestiny 2 was not started.");
+        ui::error(i18n::text(i18n::Msg::internal_failure) + i18n::text(i18n::Msg::see_log) +
+                  i18n::text(i18n::Msg::game_not_started));
         return static_cast<int>(ExitCode::internal);
     }
 }

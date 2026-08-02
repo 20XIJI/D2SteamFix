@@ -33,10 +33,19 @@ public:
         return *this;
     }
 
+    // Message-box wording in the user's language, when the failure has something actionable to
+    // say. The stage and detail above stay English because they are what reaches the log.
+    [[nodiscard]] const std::wstring& guidance() const noexcept { return guidance_; }
+    AppError& with_guidance(std::wstring text) {
+        guidance_ = std::move(text);
+        return *this;
+    }
+
 private:
     ExitCode code_;
     std::string stage_;
     std::string detail_;
+    std::wstring guidance_;
     bool launcher_started_ = false;
 };
 

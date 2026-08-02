@@ -1,5 +1,7 @@
 #include "steamfix/ui.hpp"
 
+#include "steamfix/i18n.hpp"
+
 #include <windows.h>
 
 #include <string>
@@ -12,7 +14,8 @@ void show(const std::wstring_view message, const UINT flags) noexcept {
         const std::wstring text(message);
         MessageBoxW(nullptr, text.c_str(), L"D2SteamFix", MB_OK | flags | MB_SETFOREGROUND);
     } catch (...) {
-        MessageBoxW(nullptr, L"D2SteamFix could not format this message.",
+        // i18n::literal does not allocate, so it is safe on this path.
+        MessageBoxW(nullptr, i18n::literal(i18n::Msg::format_failure),
                     L"D2SteamFix", MB_OK | flags | MB_SETFOREGROUND);
     }
 }
