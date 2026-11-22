@@ -14,8 +14,21 @@ class Logger;
 
 namespace steamfix::process {
 
+struct ProcessInfo {
+    DWORD pid;
+    DWORD parent_pid;
+    std::wstring name;
+};
+
+std::vector<ProcessInfo> snapshot();
 UniqueHandle open_query(DWORD pid);
 std::filesystem::path image_path(HANDLE process);
+std::filesystem::path current_executable();
+bool is_destiny_name(const std::wstring& name) noexcept;
+bool is_steam_name(const std::wstring& name) noexcept;
+bool is_shared_steam_service(const std::filesystem::path& image);
+bool is_inside_steam(const std::filesystem::path& image, const std::filesystem::path& directory);
+bool is_steam_process(const std::filesystem::path& image, const std::filesystem::path& selected_directory = {});
 std::vector<std::pair<DWORD, std::wstring>> matching_in_dir(const std::filesystem::path& directory);
 std::optional<int> monitor(HANDLE child, DWORD child_pid, const std::filesystem::path& game_dir,
                            const Logger& log) noexcept;

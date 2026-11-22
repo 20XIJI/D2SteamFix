@@ -33,8 +33,8 @@ std::optional<std::filesystem::path> loaded_renderer() {
         throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
     }
     do {
-        if (_wcsicmp(entry.szModule, L"GameOverlayRenderer64.dll") == 0 ||
-            _wcsicmp(entry.szModule, L"GameOverlayRenderer.dll") == 0) {
+        if (_wcsicmp(entry.szModule, constants::renderer64_name) == 0 ||
+            _wcsicmp(entry.szModule, constants::renderer32_name) == 0) {
             return std::filesystem::path(entry.szExePath);
         }
     } while (Module32NextW(snapshot.get(), &entry));

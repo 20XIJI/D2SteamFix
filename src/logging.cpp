@@ -21,14 +21,7 @@ Logger::Logger(const fs::path& path) {
     file_ = elevation::open_file(path, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_ALWAYS,
                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT);
-    BY_HANDLE_FILE_INFORMATION information{};
-    if (!GetFileInformationByHandle(file_.get(), &information)) {
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "inspect log");
-    }
-    if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
-        information.nNumberOfLinks != 1) {
-        throw std::runtime_error("steamfix.log must be a regular file without links");
-    }
+    static_cast<void>(inspect_regular_file(file_.get(), true, "steamfix.log must be a regular file without links"));
 }
 
 void Logger::info(const std::string_view message) const noexcept { write("INFO", message); }

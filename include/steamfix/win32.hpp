@@ -2,13 +2,29 @@
 
 #include <windows.h>
 
+#include <cstddef>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <vector>
 
 namespace steamfix {
+
+namespace constants {
+inline constexpr wchar_t renderer64_name[] = L"GameOverlayRenderer64.dll";
+inline constexpr wchar_t renderer32_name[] = L"GameOverlayRenderer.dll";
+inline constexpr wchar_t session_mutex_name[] = L"Global\\D2SteamFix-1085660";
+} // namespace constants
+
+[[noreturn]] inline void throw_win32(const DWORD code = GetLastError()) {
+    throw std::system_error(static_cast<int>(code), std::system_category());
+}
+
+inline bool is_missing_error(const DWORD code) noexcept {
+    return code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND;
+}
 
 class UniqueHandle {
 public:
@@ -105,6 +121,33 @@ inline std::string display_path(const std::filesystem::path& value) {
 
 inline std::string windows_error(DWORD code = GetLastError()) {
     return std::system_error(static_cast<int>(code), std::system_category()).what();
+}
+
+inline std::vector<std::byte> query_token_info(const HANDLE token, const TOKEN_INFORMATION_CLASS which,
+                                               const size_t minimum, const char* invalid_size_message) {
+    DWORD needed = 0;
+    if (GetTokenInformation(token, which, nullptr, 0, &needed)) {
+        throw std::runtime_error(invalid_size_message);
+    }
+    const DWORD error = GetLastError();
+    if (error != ERROR_INSUFFICIENT_BUFFER) throw_win32(error);
+    if (static_cast<size_t>(needed) < minimum) throw std::runtime_error(invalid_size_message);
+    std::vector<std::byte> buffer(needed);
+    if (!GetTokenInformation(token, which, buffer.data(), needed, &needed)) throw_win32();
+    if (static_cast<size_t>(needed) < minimum) throw std::runtime_error(invalid_size_message);
+    buffer.resize(needed);
+    return buffer;
+}
+
+inline BY_HANDLE_FILE_INFORMATION inspect_regular_file(const HANDLE handle, const bool require_single_link,
+                                                       const char* invalid_message) {
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (!GetFileInformationByHandle(handle, &information)) throw_win32();
+    if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+        (require_single_link && information.nNumberOfLinks != 1)) {
+        throw std::runtime_error(invalid_message);
+    }
+    return information;
 }
 
 } // namespace steamfix

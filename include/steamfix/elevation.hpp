@@ -63,6 +63,7 @@ std::optional<int> dispatch_helper(const std::vector<std::wstring>& arguments);
 
 // Use the interactive desktop user's token when an elevated wrapper starts a
 // child. Returns false if the desktop token is unavailable or no change is needed.
+std::optional<UniqueHandle> desktop_user_token() noexcept;
 bool launch_as_desktop_user(const std::filesystem::path& executable,
                             const std::wstring& command_line,
                             const std::filesystem::path& directory,
