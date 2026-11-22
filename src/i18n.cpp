@@ -21,44 +21,39 @@ constexpr std::array entries{
           L"D2SteamFix 不是由 Steam 以 Destiny 2 的启动命令调起的。\n\n"
           L"请在 Steam 的启动选项中按以下格式使用本程序：\n"
           L"\"C:\\路径\\steamfix.exe\" %command%\n\nDestiny 2 未启动。"},
-    Entry{L"D2SteamFix restored renderer permissions left by an interrupted session.\n\n",
-          L"D2SteamFix 已恢复上次中断的会话遗留的渲染器权限。\n\n"},
+    Entry{L"D2SteamFix could not read its command line: ",
+          L"D2SteamFix 无法读取命令行参数："},
     Entry{L"D2SteamFix could not determine its executable path: ",
           L"D2SteamFix 无法确定自身的可执行文件路径："},
-    Entry{L"D2SteamFix could not determine the current working directory for its log and "
+    Entry{L"D2SteamFix could not determine the Destiny 2 directory for its log and "
           L"recovery files.\n\n",
-          L"D2SteamFix 无法确定用于存放日志与恢复文件的当前工作目录。\n\n"},
-    Entry{L"D2SteamFix could not open steamfix.log in the current working directory. "
-          L"Ensure the working directory is writable.\n\n",
-          L"D2SteamFix 无法在当前工作目录中打开 steamfix.log。请确认该目录可写。\n\n"},
-    Entry{L"D2SteamFix found interrupted permission recovery state.\n\n"
-          L"Close Destiny 2 before continuing. After you select OK, D2SteamFix waits for every "
-          L"Destiny process to exit, then requires 30 seconds of quiet before restoring "
-          L"permissions. It gives up after two minutes of waiting.",
-          L"D2SteamFix 发现上次中断留下的权限恢复状态。\n\n"
-          L"请先关闭 Destiny 2 再继续。点击「确定」后，D2SteamFix 会等待所有 Destiny 进程退出，"
-          L"再确认连续 30 秒无进程活动，然后恢复权限。等待超过两分钟则放弃。"},
-    Entry{L"D2SteamFix is running with an administrator token. It never asks for one: its "
-          L"manifest declares asInvoker, so the token came from whatever started it.",
-          L"D2SteamFix 正在以管理员令牌运行。它自己从不请求提权——程序清单声明为 asInvoker——"
-          L"因此这个令牌来自启动它的程序。"},
-    Entry{L"\n\nElevated by: ", L"\n\n提权来源："},
-    Entry{L"\n\nRight-click that program, select Properties -> Compatibility, and clear \"Run "
-          L"this program as an administrator\" (clear it under \"Change settings for all users\" "
-          L"as well), then start it again.",
-          L"\n\n右键该程序，选择「属性」→「兼容性」，取消勾选「以管理员身份运行此程序」"
-          L"（「更改所有用户的设置」中同样取消），然后重新启动它。"},
-    Entry{L"\n\nRight-click steamfix.exe and Steam, select Properties -> Compatibility, and clear "
-          L"\"Run this program as an administrator\" on both (clear it under \"Change settings "
-          L"for all users\" as well), then restart Steam.",
-          L"\n\n分别右键 steamfix.exe 与 Steam，选择「属性」→「兼容性」，两者都取消勾选"
-          L"「以管理员身份运行此程序」（「更改所有用户的设置」中同样取消），然后重启 Steam。"},
+          L"D2SteamFix 无法确定用于存放日志与恢复文件的 Destiny 2 目录。\n\n"},
+    Entry{L"D2SteamFix could not open steamfix.log in the Destiny 2 directory. "
+          L"Ensure the game directory is writable.\n\n",
+          L"D2SteamFix 无法在 Destiny 2 目录中打开 steamfix.log。请确认游戏目录可写。\n\n"},
+    Entry{L"D2SteamFix could not complete its administrator session.\n\n",
+          L"D2SteamFix 未能完成管理员会话。\n\n"},
+    Entry{L"\n\nOriginal renderer permissions were restored before the administrator session "
+          L"was requested.",
+          L"\n\n在请求管理员会话之前，已恢复原始渲染器权限。"},
+    Entry{L"Steam file repair could not finish.\n\n",
+          L"Steam 文件修复未能完成。\n\n"},
+    Entry{L"Steam and Destiny 2 will close so Steam can repair its files.",
+          L"即将关闭 Steam 和 Destiny 2，以便 Steam 修复其文件。"},
+    Entry{L"Continue", L"继续"},
+    Entry{L"Cancel", L"取消"},
+    Entry{L"Locate Steam's steam.exe", L"定位 Steam 的 steam.exe"},
+    Entry{L"Select Steam's steam.exe file.\n\n", L"请选择 Steam 的 steam.exe 文件。\n\n"},
+    Entry{L"Steam repaired its files. You can start Steam again.",
+          L"Steam 已完成文件修复，现在可以重新启动 Steam。"},
     Entry{L"D2SteamFix encountered an unexpected internal failure.",
           L"D2SteamFix 遇到意外的内部错误。"},
     Entry{L"D2SteamFix failed during ", L"D2SteamFix 在「"},
     Entry{L":\n\n", L"」阶段失败：\n\n"},
-    Entry{L"\n\nSee steamfix.log in the current working directory.\n\n",
-          L"\n\n详见当前工作目录下的 steamfix.log。\n\n"},
+    Entry{L"\n\nSee steamfix.log in the Destiny 2 directory.\n\n",
+          L"\n\n详见 Destiny 2 目录下的 steamfix.log。\n\n"},
+    Entry{L"\n\nSee steamfix.log in the Destiny 2 directory.",
+          L"\n\n详见 Destiny 2 目录下的 steamfix.log。"},
     Entry{L"\n\nError code ", L"\n\n错误代码 "},
     Entry{L"Destiny 2 is already running.\n\nClose the game completely and try again. If it is "
           L"not visible, end destiny2.exe and destiny2launcher.exe in Task Manager.",
@@ -77,8 +72,6 @@ constexpr std::array entries{
 
 static_assert(entries.size() == static_cast<std::size_t>(Msg::count));
 
-// ponytail: a single Chinese variant selected on the primary language id. Add SUBLANGID
-// handling if traditional-Chinese wording is ever asked for.
 bool prefer_chinese() noexcept {
     return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_CHINESE;
 }

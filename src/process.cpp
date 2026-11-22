@@ -158,56 +158,6 @@ std::vector<std::pair<DWORD, std::wstring>> matching_in_dir(const fs::path& dire
     return result;
 }
 
-void wait_for_destiny_quiescence(const Logger& log) {
-    constexpr auto clean_interval = std::chrono::seconds(30);
-    constexpr auto blocked_limit = std::chrono::seconds(120);
-    // Candidates are matched on name alone. Recovery runs before the command line is parsed, so
-    // there is no game directory to compare against, and any Destiny process may be holding the
-    // renderer this state file describes.
-    std::optional<std::chrono::steady_clock::time_point> clear_since;
-    std::optional<std::chrono::steady_clock::time_point> blocked_since;
-    unsigned blocked_polls = 0;
-    for (;;) {
-        std::optional<ProcessInfo> candidate;
-        for (const ProcessInfo& item : snapshot()) {
-            if (process_name_is(item.name, L"destiny2launcher.exe") ||
-                process_name_is(item.name, L"destiny2.exe")) {
-                candidate = item;
-                break;
-            }
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (candidate) {
-            clear_since.reset();
-            if (!blocked_since) blocked_since = now;
-            if (blocked_polls % 20 == 0) {
-                log.info("pending ACL recovery is waiting for a Destiny process to exit: pid=" +
-                         std::to_string(candidate->pid) + ", name=" + narrow(candidate->name));
-            }
-            increment_saturated(blocked_polls);
-            if (now - *blocked_since >= blocked_limit) {
-                throw std::runtime_error(
-                    "Destiny was still running two minutes after the prompt. Close Destiny 2 "
-                    "completely, or end it in Task Manager if it is not responding, then start the "
-                    "game again. Last seen: " + narrow(candidate->name) + ", pid=" +
-                    std::to_string(candidate->pid));
-            }
-        } else {
-            blocked_since.reset();
-            blocked_polls = 0;
-            if (!clear_since) {
-                clear_since = now;
-                log.info("pending ACL recovery found no named Destiny process; beginning 30-second "
-                         "safety interval");
-            } else if (now - *clear_since >= clean_interval) {
-                log.info("pending ACL recovery confirmed Destiny process quiescence");
-                return;
-            }
-        }
-        Sleep(500);
-    }
-}
-
 std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::path& game_dir,
                            const Logger& log) noexcept {
     using Key = std::pair<DWORD, std::uint64_t>;
@@ -250,9 +200,12 @@ std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::
                         child_finished = true;
                         child_status = static_cast<int>(status);
                     } else {
-                        const DWORD error = GetLastError();
-                        record_child_wait_failure("GetExitCodeProcess failed: " +
-                                                  windows_error(error));
+                        // The signaled process handle proves the launcher exited.
+                        // UAC may provide a waitable handle without exit-code rights.
+                        child_finished = true;
+                        child_wait_failures = 0;
+                        log.warn("original launcher exited; exit status is unavailable: " +
+                                 windows_error(GetLastError()));
                     }
                 } else {
                     const std::string detail =

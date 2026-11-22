@@ -6,15 +6,21 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         configuration: [Release, Debug]
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # The project builds with /W4 /WX, so a warning fails this step.
       - name: Configure

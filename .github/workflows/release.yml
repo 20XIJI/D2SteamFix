@@ -9,13 +9,33 @@ on:
         description: 'Tag to publish'
         required: true
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: windows-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify release version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          $project = Get-Content CMakeLists.txt -Raw
+          $version = [regex]::Match($project, 'project\(D2SteamFix VERSION (\d+\.\d+\.\d+)\b')
+          if (-not $version.Success -or $env:TAG -cne "v$($version.Groups[1].Value)") {
+            throw "Release tag ($env:TAG) must match the CMake project version (vX.Y.Z)."
+          }
 
       - name: Build
         run: |
