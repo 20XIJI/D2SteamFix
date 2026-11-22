@@ -333,13 +333,13 @@ int run(const Logger& log, const fs::path& resolved_launcher,
     log.info("renderer execute denial established for the current user");
     bool launcher_started = false;
     std::exception_ptr session_error;
-    std::optional<int> exit_status;
+    process::MonitorResult monitor_result;
     try {
         check_overlay(OverlayCheck::fatal, log);
         ChildProcess child = launch(invocation, steam_directory, log);
         launcher_started = true;
         log.info("launched destiny2launcher.exe; beginning fail-closed process monitoring");
-        exit_status = process::monitor(child.process.get(), child.pid, invocation.game_dir, log);
+        monitor_result = process::monitor(child.process.get(), child.pid, invocation.game_dir, log);
     } catch (...) {
         session_error = std::current_exception();
     }
@@ -367,13 +367,23 @@ int run(const Logger& log, const fs::path& resolved_launcher,
         throw combined;
     }
     if (session_error) rethrow_session_error(session_error, launcher_started);
-    if (exit_status) {
-        log.info("original launcher exit status: " + std::to_string(*exit_status));
-    } else {
+    const std::string launcher_exit =
+        monitor_result.exit_status ? std::to_string(*monitor_result.exit_status) : "unavailable";
+    if (!monitor_result.exit_status) {
         log.warn("original launcher exit status was unavailable");
     }
-    log.info("permission cleanup successful");
-    return exit_status.value_or(0);
+    std::string elevated_label = "unknown";
+    try {
+        elevated_label = elevation::is_elevated() ? "yes" : "no";
+    } catch (...) {
+    }
+    log.info("session summary: duration=" + std::to_string(monitor_result.duration.count()) +
+             "s, game_observed=" + std::string(monitor_result.game_observed ? "yes" : "no") +
+             ", renderers=" + std::to_string(targets.size()) +
+             ", elevated=" + elevated_label +
+             ", launcher_exit=" + launcher_exit +
+             ", permissions=restored");
+    return monitor_result.exit_status.value_or(0);
 }
 
 std::wstring error_code_suffix(const ExitCode code) {
@@ -497,7 +507,16 @@ int entry() {
                   error_code_suffix(ExitCode::log_initialization));
         return static_cast<int>(ExitCode::log_initialization);
     }
-    log->info("startup; wrapper path: " + display_path(executable) +
+    std::string elevated_label = "unknown";
+    try {
+        elevated_label = elevation::is_elevated() ? "yes" : "no";
+    } catch (...) {
+    }
+    log->info("--- session start: D2SteamFix v" STEAMFIX_VERSION "; pid=" +
+              std::to_string(GetCurrentProcessId()) +
+              "; mode=" + (forwarded.empty() ? "direct-repair" : "steam-launch") +
+              "; elevated=" + elevated_label + " ---");
+    log->info("wrapper path: " + display_path(executable) +
               "; game directory: " + display_path(game_directory));
     try {
         const fs::path recovery = acl::recovery_path(game_directory);

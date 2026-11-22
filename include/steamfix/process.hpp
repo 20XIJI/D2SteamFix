@@ -2,6 +2,7 @@
 
 #include "steamfix/win32.hpp"
 
+#include <chrono>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -30,8 +31,14 @@ bool is_shared_steam_service(const std::filesystem::path& image);
 bool is_inside_steam(const std::filesystem::path& image, const std::filesystem::path& directory);
 bool is_steam_process(const std::filesystem::path& image, const std::filesystem::path& selected_directory = {});
 std::vector<std::pair<DWORD, std::wstring>> matching_in_dir(const std::filesystem::path& directory);
-std::optional<int> monitor(HANDLE child, DWORD child_pid, const std::filesystem::path& game_dir,
-                           const Logger& log) noexcept;
+struct MonitorResult {
+    std::optional<int> exit_status;
+    bool game_observed = false;
+    std::chrono::seconds duration{0};
+};
+
+MonitorResult monitor(HANDLE child, DWORD child_pid, const std::filesystem::path& game_dir,
+                      const Logger& log) noexcept;
 std::vector<DWORD> parent_chain();
 
 } // namespace steamfix::process

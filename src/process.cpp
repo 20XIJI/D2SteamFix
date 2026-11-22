@@ -345,8 +345,9 @@ std::vector<std::pair<DWORD, std::wstring>> matching_in_dir(const fs::path& dire
     return result;
 }
 
-std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::path& game_dir,
-                           const Logger& log) noexcept {
+MonitorResult monitor(const HANDLE child, const DWORD child_pid, const fs::path& game_dir,
+                      const Logger& log) noexcept {
+    const auto started_at = ReleaseState::Clock::now();
     std::map<ProcessKey, std::wstring> tracked;
     std::set<ProcessKey> previous;
     ReleaseState release;
@@ -409,7 +410,9 @@ std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::
                  "exited and the grace period elapsed. If the game started after that point, the "
                  "Steam overlay was not blocked for this session.");
     }
-    return child_state.status;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        ReleaseState::Clock::now() - started_at);
+    return {child_state.status, release.game_was_observed(), elapsed};
 }
 
 std::vector<DWORD> parent_chain() {

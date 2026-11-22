@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(D2SteamFix VERSION 1.1.1 LANGUAGES CXX)
+project(D2SteamFix VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
