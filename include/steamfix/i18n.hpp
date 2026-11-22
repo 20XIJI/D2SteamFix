@@ -8,7 +8,6 @@ namespace steamfix::i18n {
 // language: steamfix.log and the technical detail carried by AppError stay English so that
 // user-supplied reports remain readable to maintainers.
 enum class Msg {
-    invalid_invocation,
     command_line_failure,
     executable_path_failure,
     game_directory_failure,
@@ -16,7 +15,9 @@ enum class Msg {
     admin_session_failure_intro,
     admin_session_failure_outro,
     repair_failure_intro,
-    repair_confirm_instruction,
+    repair_confirm_direct,
+    repair_confirm_blocked_without_backup,
+    repair_confirm_unusable_backup_blocked,
     repair_continue_button,
     repair_cancel_button,
     repair_locate_steam_title,
@@ -29,7 +30,11 @@ enum class Msg {
     see_log_only,
     error_code,
     destiny_running,
+    session_already_active,
     wrong_forwarded_executable,
+    wrong_steam_app_id,
+    steam_discovery_guidance,
+    overlay_protection_guidance,
     launcher_started,
     game_not_started,
     format_failure,

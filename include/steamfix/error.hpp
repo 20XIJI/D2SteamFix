@@ -33,6 +33,12 @@ public:
         return *this;
     }
 
+    [[nodiscard]] bool is_repair_failure() const noexcept { return repair_failure_; }
+    AppError& as_repair_failure() noexcept {
+        repair_failure_ = true;
+        return *this;
+    }
+
     // Message-box wording in the user's language, when the failure has something actionable to
     // say. The stage and detail above stay English because they are what reaches the log.
     [[nodiscard]] const std::wstring& guidance() const noexcept { return guidance_; }
@@ -47,6 +53,7 @@ private:
     std::string detail_;
     std::wstring guidance_;
     bool launcher_started_ = false;
+    bool repair_failure_ = false;
 };
 
 } // namespace steamfix

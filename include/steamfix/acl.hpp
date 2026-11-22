@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -12,6 +13,18 @@ class Logger;
 }
 
 namespace steamfix::acl {
+
+enum class RecoveryStatus {
+    absent,
+    reusable,
+    unusable,
+};
+
+struct RecoveryInspection {
+    RecoveryStatus status = RecoveryStatus::absent;
+    std::string reason;
+    std::vector<std::filesystem::path> saved_paths;
+};
 
 struct Backup {
     std::filesystem::path path;
@@ -47,6 +60,10 @@ private:
 };
 
 std::filesystem::path recovery_path(const std::filesystem::path& game_directory);
-bool recover_pending(const std::filesystem::path& path, const Logger& log);
+RecoveryInspection inspect_recovery(const std::vector<std::filesystem::path>& targets,
+                                    const std::filesystem::path& state_path,
+                                    const Logger& log);
+bool any_has_current_user_execute_deny(const std::vector<std::filesystem::path>& paths);
+void remove_stale_recovery(const std::filesystem::path& state_path, const Logger& log);
 
 } // namespace steamfix::acl

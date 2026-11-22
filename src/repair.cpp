@@ -14,8 +14,6 @@
 #include <aclapi.h>
 #include <commctrl.h>
 #include <commdlg.h>
-#include <shlobj.h>
-#include <tlhelp32.h>
 
 #include <array>
 #include <chrono>
@@ -33,15 +31,7 @@ namespace steamfix::repair {
 namespace {
 
 constexpr std::array<const wchar_t*, 2> renderer_names{
-    L"GameOverlayRenderer64.dll", L"GameOverlayRenderer.dll"};
-
-[[noreturn]] void throw_win32(const DWORD error) {
-    throw std::system_error(static_cast<int>(error), std::system_category());
-}
-
-bool missing(const DWORD error) noexcept {
-    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
-}
+    constants::renderer64_name, constants::renderer32_name};
 
 class MutexLock {
 public:
@@ -51,7 +41,7 @@ public:
         if (result == WAIT_TIMEOUT) {
             throw std::runtime_error("another D2SteamFix session did not finish; close it and retry repair");
         }
-        if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) throw_win32(GetLastError());
+        if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) throw_win32();
     }
     ~MutexLock() { ReleaseMutex(handle_.get()); }
     MutexLock(const MutexLock&) = delete;
@@ -61,12 +51,9 @@ private:
 };
 
 void require_regular(const HANDLE handle, const fs::path& path) {
-    BY_HANDLE_FILE_INFORMATION information{};
-    if (!GetFileInformationByHandle(handle, &information)) throw_win32(GetLastError());
-    if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
-        information.nNumberOfLinks != 1) {
-        throw std::runtime_error("repair target is not a regular, single-link, non-reparse file: " + display_path(path));
-    }
+    const std::string message =
+        "repair target is not a regular, single-link, non-reparse file: " + display_path(path);
+    static_cast<void>(inspect_regular_file(handle, true, message.c_str()));
 }
 
 std::optional<UniqueHandle> open_existing(const fs::path& path, const DWORD access) {
@@ -77,7 +64,7 @@ std::optional<UniqueHandle> open_existing(const fs::path& path, const DWORD acce
         require_regular(handle.get(), path);
         return handle;
     } catch (const std::system_error& error) {
-        if (missing(static_cast<DWORD>(error.code().value()))) return std::nullopt;
+        if (is_missing_error(static_cast<DWORD>(error.code().value()))) return std::nullopt;
         throw;
     }
 }
@@ -85,29 +72,9 @@ std::optional<UniqueHandle> open_existing(const fs::path& path, const DWORD acce
 UniqueHandle current_token() {
     HANDLE raw = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &raw)) {
-        throw_win32(GetLastError());
+        throw_win32();
     }
     return UniqueHandle(raw);
-}
-
-std::vector<std::byte> token_user(const HANDLE token) {
-    DWORD needed = 0;
-    if (GetTokenInformation(token, TokenUser, nullptr, 0, &needed) ||
-        GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(TOKEN_USER)) {
-        throw std::runtime_error("could not determine Windows user for renderer permissions");
-    }
-    std::vector<std::byte> result(needed);
-    if (!GetTokenInformation(token, TokenUser, result.data(), needed, &needed)) {
-        throw_win32(GetLastError());
-    }
-    return result;
-}
-
-bool same_user(const HANDLE first, const HANDLE second) {
-    const std::vector<std::byte> a = token_user(first);
-    const std::vector<std::byte> b = token_user(second);
-    return EqualSid(reinterpret_cast<const TOKEN_USER*>(a.data())->User.Sid,
-                    reinterpret_cast<const TOKEN_USER*>(b.data())->User.Sid) != FALSE;
 }
 
 bool access_allowed(const HANDLE file, const HANDLE token, const DWORD access) {
@@ -132,7 +99,19 @@ bool access_allowed(const HANDLE file, const HANDLE token, const DWORD access) {
     return allowed != FALSE;
 }
 
-bool confirm() {
+const wchar_t* confirm_instruction(const Trigger trigger) noexcept {
+    switch (trigger) {
+    case Trigger::direct_launch:
+        return i18n::literal(i18n::Msg::repair_confirm_direct);
+    case Trigger::blocked_without_backup:
+        return i18n::literal(i18n::Msg::repair_confirm_blocked_without_backup);
+    case Trigger::unusable_backup_blocked:
+        return i18n::literal(i18n::Msg::repair_confirm_unusable_backup_blocked);
+    }
+    return i18n::literal(i18n::Msg::repair_confirm_direct);
+}
+
+bool confirm(const Trigger trigger) {
     const TASKDIALOG_BUTTON buttons[]{
         {IDOK, i18n::literal(i18n::Msg::repair_continue_button)},
         {IDCANCEL, i18n::literal(i18n::Msg::repair_cancel_button)},
@@ -142,7 +121,7 @@ bool confirm() {
     dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
     dialog.pszWindowTitle = L"D2SteamFix";
     dialog.pszMainIcon = TD_INFORMATION_ICON;
-    dialog.pszMainInstruction = i18n::literal(i18n::Msg::repair_confirm_instruction);
+    dialog.pszMainInstruction = confirm_instruction(trigger);
     dialog.cButtons = static_cast<UINT>(std::size(buttons));
     dialog.pButtons = buttons;
     dialog.nDefaultButton = IDCANCEL;
@@ -154,7 +133,7 @@ bool confirm() {
 
 fs::path validate_steam(const fs::path& executable) {
     if (!paths::name_is(executable, L"steam.exe")) {
-        throw std::runtime_error("select the Steam application's steam.exe file");
+        throw std::runtime_error("selected file is not steam.exe");
     }
     const fs::path directory = fs::canonical(executable.parent_path());
     const auto file = open_existing(directory / L"steam.exe", FILE_READ_ATTRIBUTES);
@@ -188,87 +167,25 @@ std::optional<fs::path> locate_steam(const Logger& log) {
         try {
             return validate_steam(fs::path(file));
         } catch (const std::exception& error) {
-            ui::error(i18n::text(i18n::Msg::repair_select_steam_error) + widen(error.what()));
+            log.warn("selected Steam path was invalid: " + std::string(error.what()));
+            ui::error(i18n::literal(i18n::Msg::repair_select_steam_error));
         }
     }
 }
 
-bool destiny_name(const std::wstring& name) noexcept {
-    return _wcsicmp(name.c_str(), L"destiny2.exe") == 0 ||
-           _wcsicmp(name.c_str(), L"destiny2launcher.exe") == 0;
+bool is_exiting_process_error(const DWORD code) noexcept {
+    return code == ERROR_INVALID_PARAMETER || code == ERROR_GEN_FAILURE ||
+           code == ERROR_PARTIAL_COPY;
 }
 
-bool steam_name(const std::wstring& name) noexcept {
-    constexpr std::array names{L"steam.exe", L"steamwebhelper.exe", L"steamservice.exe",
-        L"GameOverlayUI.exe", L"steamerrorreporter.exe", L"steamerrorreporter64.exe",
-        L"steam_monitor.exe"};
-    for (const wchar_t* candidate : names) {
-        if (_wcsicmp(name.c_str(), candidate) == 0) return true;
-    }
-    return false;
-}
-
-bool inside_steam(const fs::path& image, const fs::path& directory) {
-    // Steam's client helpers live in child directories, never in steamapps.
-    // Updating Steam may already have renamed or replaced a running image.
-    fs::path parent = fs::weakly_canonical(image.parent_path());
-    for (unsigned depth = 0; depth < 8; ++depth) {
-        if (paths::equal_windows(parent, directory)) return true;
-        if (paths::name_is(parent, L"steamapps")) return false;
-        const fs::path next = parent.parent_path();
-        if (next == parent) break;
-        parent = next;
-    }
-    return false;
-}
-
-bool shared_steam_service(const fs::path& image) {
-    if (!paths::name_is(image, L"steamservice.exe")) return false;
-    for (const int folder : {CSIDL_PROGRAM_FILES_COMMONX86, CSIDL_PROGRAM_FILES_COMMON}) {
-        std::array<wchar_t, MAX_PATH> directory{};
-        if (FAILED(SHGetFolderPathW(nullptr, folder, nullptr, SHGFP_TYPE_CURRENT, directory.data()))) continue;
-        const fs::path expected = fs::path(directory.data()) / L"Steam" / L"SteamService.exe";
-        if (paths::equal_windows(image, expected)) return true;
-    }
-    return false;
-}
-
-bool steam_process(const fs::path& image, const fs::path& selected_directory) {
-    if (inside_steam(image, selected_directory) || shared_steam_service(image)) return true;
-    // Close Steam clients from other installations too, as repair promises to
-    // close Steam before replacing files. Verify the installation by its client.
-    fs::path parent = fs::weakly_canonical(image.parent_path());
-    for (unsigned depth = 0; depth < 8; ++depth) {
-        if (paths::name_is(parent, L"steamapps")) return false;
-        const DWORD attributes = GetFileAttributesW((parent / L"steam.exe").c_str());
-        if (attributes != INVALID_FILE_ATTRIBUTES &&
-            (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0) return true;
-        const fs::path next = parent.parent_path();
-        if (next == parent) break;
-        parent = next;
-    }
-    return false;
+bool is_transient_query_error(const DWORD code) noexcept {
+    return is_exiting_process_error(code) || code == ERROR_ACCESS_DENIED;
 }
 
 struct Candidate {
     DWORD pid;
     std::wstring name;
 };
-
-std::vector<Candidate> candidates() {
-    const UniqueHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-    PROCESSENTRY32W item{};
-    item.dwSize = sizeof(item);
-    if (!Process32FirstW(snapshot.get(), &item)) throw_win32(GetLastError());
-    std::vector<Candidate> result;
-    do {
-        if (destiny_name(item.szExeFile) || steam_name(item.szExeFile)) {
-            result.push_back({item.th32ProcessID, item.szExeFile});
-        }
-    } while (Process32NextW(snapshot.get(), &item));
-    if (GetLastError() != ERROR_NO_MORE_FILES) throw_win32(GetLastError());
-    return result;
-}
 
 struct Termination {
     UniqueHandle process;
@@ -277,16 +194,37 @@ struct Termination {
 
 std::vector<Termination> prepare_shutdown(const fs::path& steam_directory) {
     std::vector<Termination> result;
-    for (const Candidate& candidate : candidates()) {
+    for (const process::ProcessInfo& item : process::snapshot()) {
+        if (!process::is_destiny_name(item.name) && !process::is_steam_name(item.name)) continue;
         try {
-            UniqueHandle handle = elevation::open_process_for_termination(candidate.pid);
+            std::optional<fs::path> prefiltered_image;
+            try {
+                const UniqueHandle query = process::open_query(item.pid);
+                const fs::path image = process::image_path(query.get());
+                if (!paths::name_is(image, item.name)) continue;
+                if (!process::is_destiny_name(item.name) &&
+                    !process::is_steam_process(image, steam_directory)) {
+                    continue;
+                }
+                prefiltered_image = image;
+            } catch (const std::system_error& error) {
+                const DWORD code = static_cast<DWORD>(error.code().value());
+                if (is_exiting_process_error(code)) continue;
+                if (code != ERROR_ACCESS_DENIED) throw;
+            }
+
+            UniqueHandle handle = elevation::open_process_for_termination(item.pid);
             if (WaitForSingleObject(handle.get(), 0) == WAIT_OBJECT_0) continue;
             const fs::path image = process::image_path(handle.get());
-            if (!paths::name_is(image, candidate.name)) continue;
-            if (!destiny_name(candidate.name) && !steam_process(image, steam_directory)) continue;
-            result.push_back({std::move(handle), candidate});
+            if (!paths::name_is(image, item.name)) continue;
+            if (prefiltered_image && !paths::equal_windows(image, *prefiltered_image)) continue;
+            if (!process::is_destiny_name(item.name) &&
+                !process::is_steam_process(image, steam_directory)) {
+                continue;
+            }
+            result.push_back({std::move(handle), {item.pid, item.name}});
         } catch (const std::system_error& error) {
-            if (static_cast<DWORD>(error.code().value()) == ERROR_INVALID_PARAMETER) continue;
+            if (is_exiting_process_error(static_cast<DWORD>(error.code().value()))) continue;
             throw;
         }
     }
@@ -300,7 +238,7 @@ void shutdown(const fs::path& steam_directory, const Logger& log) {
         // Stop the game before Steam, including processes created while Steam was closing.
         for (const bool destiny : {true, false}) {
             for (const Termination& target : targets) {
-                if (destiny_name(target.candidate.name) != destiny) continue;
+                if (process::is_destiny_name(target.candidate.name) != destiny) continue;
                 if (WaitForSingleObject(target.process.get(), 0) == WAIT_OBJECT_0) continue;
                 if (!TerminateProcess(target.process.get(), ERROR_CANCELLED)) {
                     const DWORD error = GetLastError();
@@ -308,7 +246,7 @@ void shutdown(const fs::path& steam_directory, const Logger& log) {
                 }
                 const DWORD waited = WaitForSingleObject(target.process.get(), 10000);
                 if (waited != WAIT_OBJECT_0) {
-                    if (waited == WAIT_FAILED) throw_win32(GetLastError());
+                    if (waited == WAIT_FAILED) throw_win32();
                     throw std::runtime_error("a Steam or Destiny process did not exit during repair");
                 }
                 log.info("Steam repair closed " + narrow(target.candidate.name) +
@@ -317,6 +255,7 @@ void shutdown(const fs::path& steam_directory, const Logger& log) {
         }
         targets = prepare_shutdown(steam_directory);
         if (targets.empty()) return;
+        Sleep(250);
     }
     throw std::runtime_error("Steam or Destiny processes kept restarting; renderer files were preserved");
 }
@@ -340,7 +279,7 @@ bool remove_renderers(const fs::path& directory, const Logger& log) {
         const fs::path path = directory / name;
         auto handle = open_existing(path, DELETE);
         if (handle) {
-            if (paths::name_is(path, L"GameOverlayRenderer.dll")) renderer32_was_present = true;
+            if (paths::name_is(path, constants::renderer32_name)) renderer32_was_present = true;
             opened.emplace_back(path, std::move(*handle));
         }
     }
@@ -379,13 +318,16 @@ UniqueHandle launch_repair(const fs::path& directory, const Logger& log) {
 }
 
 bool steam_client_alive(const fs::path& directory) {
-    for (const Candidate& candidate : candidates()) {
-        if (!steam_name(candidate.name) || _wcsicmp(candidate.name.c_str(), L"steamservice.exe") == 0) continue;
+    for (const process::ProcessInfo& item : process::snapshot()) {
+        if (!process::is_steam_name(item.name) ||
+            _wcsicmp(item.name.c_str(), L"steamservice.exe") == 0) {
+            continue;
+        }
         try {
-            const UniqueHandle handle = process::open_query(candidate.pid);
-            if (inside_steam(process::image_path(handle.get()), directory)) return true;
+            const UniqueHandle handle = process::open_query(item.pid);
+            if (process::is_inside_steam(process::image_path(handle.get()), directory)) return true;
         } catch (const std::system_error& error) {
-            if (static_cast<DWORD>(error.code().value()) == ERROR_INVALID_PARAMETER) continue;
+            if (is_transient_query_error(static_cast<DWORD>(error.code().value()))) return true;
             throw;
         }
     }
@@ -398,13 +340,13 @@ void wait_for_repair(const HANDLE child, const fs::path& directory, const Logger
     std::optional<Clock::time_point> quiet_since;
     for (;;) {
         const DWORD wait = WaitForSingleObject(child, 500);
-        if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0) throw_win32(GetLastError());
+        if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0) throw_win32();
         if (wait == WAIT_OBJECT_0 && !steam_client_alive(directory)) {
             const auto now = Clock::now();
             if (!quiet_since) quiet_since = now;
             if (now - *quiet_since >= std::chrono::seconds(3)) {
                 DWORD code = 0;
-                if (!GetExitCodeProcess(child, &code)) throw_win32(GetLastError());
+                if (!GetExitCodeProcess(child, &code)) throw_win32();
                 log.info("Steam repair processes exited; original bootstrap status=" + std::to_string(code));
                 return;
             }
@@ -419,32 +361,13 @@ void wait_for_repair(const HANDLE child, const fs::path& directory, const Logger
 }
 
 UniqueHandle verification_token(const Logger& log) {
-    UniqueHandle caller = current_token();
     if (elevation::is_elevated()) {
-        const HWND shell = GetShellWindow();
-        DWORD pid = 0;
-        if (shell != nullptr) GetWindowThreadProcessId(shell, &pid);
-        if (pid != 0) {
-            const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-            if (process != nullptr) {
-                const UniqueHandle owner(process);
-                HANDLE token = nullptr;
-                if (OpenProcessToken(owner.get(), TOKEN_QUERY | TOKEN_DUPLICATE, &token)) {
-                    UniqueHandle desktop(token);
-                    TOKEN_ELEVATION elevation{};
-                    DWORD returned = 0;
-                    if (GetTokenInformation(desktop.get(), TokenElevation, &elevation,
-                                             sizeof(elevation), &returned) &&
-                        returned == sizeof(elevation) && elevation.TokenIsElevated == 0 &&
-                        same_user(caller.get(), desktop.get())) {
-                        return desktop;
-                    }
-                }
-            }
+        if (std::optional<UniqueHandle> desktop = elevation::desktop_user_token()) {
+            return std::move(*desktop);
         }
         log.info("same-user normal desktop token unavailable; verifying renderer access in caller context");
     }
-    return caller;
+    return current_token();
 }
 
 void verify_repaired(const fs::path& directory, const bool renderer32_was_present,
@@ -453,7 +376,7 @@ void verify_repaired(const fs::path& directory, const bool renderer32_was_presen
     for (const wchar_t* name : renderer_names) {
         const fs::path path = directory / name;
         const auto file = open_existing(path, READ_CONTROL);
-        if (!file && paths::name_is(path, L"GameOverlayRenderer.dll") && !renderer32_was_present) {
+        if (!file && paths::name_is(path, constants::renderer32_name) && !renderer32_was_present) {
             log.info("optional GameOverlayRenderer.dll was absent before repair and remains absent");
             continue;
         }
@@ -467,16 +390,23 @@ void verify_repaired(const fs::path& directory, const bool renderer32_was_presen
 
 } // namespace
 
-bool needed(const fs::path& steam_directory, const Logger& log) {
+bool any_execute_blocked(const std::vector<fs::path>& paths, const Logger& log) {
     const UniqueHandle token = verification_token(log);
-    for (const wchar_t* name : renderer_names) {
-        const auto file = open_existing(steam_directory / name, READ_CONTROL);
+    for (const fs::path& path : paths) {
+        const auto file = open_existing(path, READ_CONTROL);
         if (file && !access_allowed(file->get(), token.get(), FILE_EXECUTE)) return true;
     }
     return false;
 }
 
-bool run(const fs::path& game_directory, const fs::path& recovery_path, const Logger& log) {
+bool needed(const fs::path& steam_directory, const Logger& log) {
+    return any_execute_blocked(
+        {steam_directory / constants::renderer64_name, steam_directory / constants::renderer32_name},
+        log);
+}
+
+bool run(const fs::path& game_directory, const fs::path& recovery_path, const Trigger trigger,
+         const Logger& log) {
     try {
         const MutexLock repair_lock(L"Global\\D2SteamFix-Repair-1085660", 0);
         const fs::path game = fs::canonical(game_directory);
@@ -485,7 +415,7 @@ bool run(const fs::path& game_directory, const fs::path& recovery_path, const Lo
             throw std::runtime_error("repair recovery path does not match the game directory");
         }
         const std::optional<fs::path> directory = locate_steam(log);
-        if (!directory || !confirm()) {
+        if (!directory || !confirm(trigger)) {
             log.info("Steam repair cancelled; recovery state was preserved");
             return false;
         }
@@ -494,7 +424,7 @@ bool run(const fs::path& game_directory, const fs::path& recovery_path, const Lo
         elevation::ensure_broker();
         shutdown(*directory, log);
         // An active wrapper must finish restoring and release its renderer handles first.
-        const MutexLock session_lock(L"Global\\D2SteamFix-1085660", 45000);
+        const MutexLock session_lock(constants::session_mutex_name, 150000);
         // Do not touch renderer files if a new Steam or Destiny process appeared.
         shutdown(*directory, log);
         const bool renderer32_was_present = remove_renderers(*directory, log);
@@ -516,11 +446,13 @@ bool run(const fs::path& game_directory, const fs::path& recovery_path, const Lo
             log.info("Steam repair elevation declined; recovery state was preserved");
             return false;
         }
-        throw AppError(ExitCode::overlay_protection, "Steam file repair", error.what());
+        throw AppError(ExitCode::overlay_protection, "Steam file repair", error.what())
+            .as_repair_failure();
     } catch (const AppError&) {
         throw;
     } catch (const std::exception& error) {
-        throw AppError(ExitCode::overlay_protection, "Steam file repair", error.what());
+        throw AppError(ExitCode::overlay_protection, "Steam file repair", error.what())
+            .as_repair_failure();
     }
 }
 

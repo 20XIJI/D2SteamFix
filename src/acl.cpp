@@ -2,6 +2,7 @@
 
 #include "steamfix/error.hpp"
 #include "steamfix/elevation.hpp"
+#include "steamfix/i18n.hpp"
 #include "steamfix/logging.hpp"
 #include "steamfix/paths.hpp"
 #include "steamfix/win32.hpp"
@@ -39,10 +40,6 @@ constexpr std::uintmax_t max_state_file = max_state + 64U * 1024U;
 constexpr std::uint32_t max_entries = 2;
 
 static_assert(sizeof(wchar_t) == sizeof(std::uint16_t));
-
-[[noreturn]] void throw_win32(const DWORD code) {
-    throw std::system_error(static_cast<int>(code), std::system_category());
-}
 
 size_t checked_add(const size_t left, const size_t right) {
     if (right > std::numeric_limits<size_t>::max() - left) {
@@ -198,14 +195,10 @@ void validate_target_name(const fs::path& path) {
     if (!path.is_absolute() || !path.has_parent_path()) {
         throw std::runtime_error("recovery target is not an absolute renderer path");
     }
-    if (!paths::name_is(path, L"GameOverlayRenderer64.dll") &&
-        !paths::name_is(path, L"GameOverlayRenderer.dll")) {
+    if (!paths::name_is(path, constants::renderer64_name) &&
+        !paths::name_is(path, constants::renderer32_name)) {
         throw std::runtime_error("recovery target is not a Steam renderer");
     }
-}
-
-bool missing_error(const DWORD error) noexcept {
-    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
 }
 
 bool has_regular_steam_neighbor(const fs::path& path) {
@@ -213,7 +206,7 @@ bool has_regular_steam_neighbor(const fs::path& path) {
     const DWORD attributes = GetFileAttributesW(steam.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
         const DWORD error = GetLastError();
-        if (missing_error(error)) return false;
+        if (is_missing_error(error)) return false;
         throw_win32(error);
     }
     return (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
@@ -247,14 +240,34 @@ OpenedTarget open_target(const fs::path& path, const DWORD desired_access) {
     UniqueHandle handle = elevation::open_file(path, desired_access,
         FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT);
     BY_HANDLE_FILE_INFORMATION information{};
-    if (!GetFileInformationByHandle(handle.get(), &information)) throw_win32(GetLastError());
-    if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
-        throw UnsafeTarget("renderer target is not a regular, non-reparse file");
+    try {
+        information = inspect_regular_file(
+            handle.get(), false, "renderer target is not a regular, non-reparse file");
+    } catch (const std::system_error&) {
+        throw;
+    } catch (const std::runtime_error& error) {
+        throw UnsafeTarget(error.what());
     }
     const std::uint64_t index =
         (static_cast<std::uint64_t>(information.nFileIndexHigh) << 32U) |
         information.nFileIndexLow;
     return {std::move(handle), {information.dwVolumeSerialNumber, index}};
+}
+
+std::vector<std::byte> current_descriptor(const HANDLE handle) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD status = GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                         nullptr, nullptr, nullptr, nullptr, &descriptor);
+    if (status != ERROR_SUCCESS) throw_win32(status);
+    LocalMemory memory(descriptor);
+    const DWORD length = GetSecurityDescriptorLength(descriptor);
+    if (length == 0 || length > max_state) {
+        throw std::runtime_error("invalid security descriptor length");
+    }
+    std::vector<std::byte> bytes(length);
+    std::memcpy(bytes.data(), descriptor, length);
+    static_cast<void>(descriptor_parts(bytes));
+    return bytes;
 }
 
 struct OpenBackup {
@@ -267,19 +280,7 @@ OpenBackup make_backup(const fs::path& path) {
     validate_target_name(path);
     require_regular_steam_neighbor(path);
     OpenedTarget opened = open_target(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES);
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    const DWORD status = GetSecurityInfo(opened.handle.get(), SE_FILE_OBJECT,
-                                         DACL_SECURITY_INFORMATION, nullptr, nullptr,
-                                         nullptr, nullptr, &descriptor);
-    if (status != ERROR_SUCCESS) throw_win32(status);
-    LocalMemory memory(descriptor);
-    const DWORD length = GetSecurityDescriptorLength(descriptor);
-    if (length == 0 || length > max_state) {
-        throw std::runtime_error("invalid security descriptor length");
-    }
-    Backup backup{path, std::vector<std::byte>(length), {}};
-    std::memcpy(backup.descriptor.data(), descriptor, length);
-    static_cast<void>(descriptor_parts(backup.descriptor));
+    Backup backup{path, current_descriptor(opened.handle.get()), {}};
     return {std::move(backup), std::move(opened.handle), opened.identity};
 }
 
@@ -293,32 +294,15 @@ struct UserIdentity {
     PSID owner_sid = nullptr;
 };
 
-std::vector<std::byte> token_information(const HANDLE token, const TOKEN_INFORMATION_CLASS which,
-                                         const size_t minimum, const char* message) {
-    DWORD needed = 0;
-    SetLastError(ERROR_SUCCESS);
-    static_cast<void>(GetTokenInformation(token, which, nullptr, 0, &needed));
-    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < minimum) {
-        const DWORD error = GetLastError();
-        if (error == ERROR_SUCCESS) throw std::runtime_error(message);
-        throw_win32(error);
-    }
-    std::vector<std::byte> data(needed);
-    if (!GetTokenInformation(token, which, data.data(), needed, &needed)) {
-        throw_win32(GetLastError());
-    }
-    return data;
-}
-
 UserIdentity current_user() {
     HANDLE raw = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) throw_win32(GetLastError());
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) throw_win32();
     UserIdentity result{UniqueHandle(raw), {}, nullptr, {}, nullptr};
-    result.data = token_information(result.token.get(), TokenUser, sizeof(TOKEN_USER),
-                                    "invalid current-user token size");
+    result.data = query_token_info(result.token.get(), TokenUser, sizeof(TOKEN_USER),
+                                   "invalid current-user token size");
     result.sid = reinterpret_cast<TOKEN_USER*>(result.data.data())->User.Sid;
-    result.owner_data = token_information(result.token.get(), TokenOwner, sizeof(TOKEN_OWNER),
-                                          "invalid current-owner token size");
+    result.owner_data = query_token_info(result.token.get(), TokenOwner, sizeof(TOKEN_OWNER),
+                                         "invalid current-owner token size");
     result.owner_sid = reinterpret_cast<TOKEN_OWNER*>(result.owner_data.data())->Owner;
     return result;
 }
@@ -392,16 +376,16 @@ HANDLE open_access_raw(const fs::path& path, const DWORD access) {
 
 void verify_denied(const Backup& backup, HANDLE handle);
 
-bool has_current_user_execute_deny(const Backup& backup, PSID sid) {
-    const DescriptorParts original = descriptor_parts(backup.descriptor);
+bool has_current_user_execute_deny(const std::span<const std::byte> descriptor, PSID sid) {
+    const DescriptorParts original = descriptor_parts(descriptor);
     if (original.dacl == nullptr) return false;
     ACL_SIZE_INFORMATION size{};
     if (!GetAclInformation(original.dacl, &size, sizeof(size), AclSizeInformation)) {
-        throw_win32(GetLastError());
+        throw_win32();
     }
     for (DWORD index = 0; index < size.AceCount; ++index) {
         void* ace = nullptr;
-        if (!GetAce(original.dacl, index, &ace)) throw_win32(GetLastError());
+        if (!GetAce(original.dacl, index, &ace)) throw_win32();
         const auto* header = static_cast<const ACE_HEADER*>(ace);
         if (header->AceType != ACCESS_DENIED_ACE_TYPE ||
             (header->AceFlags & INHERITED_ACE) != 0) continue;
@@ -551,22 +535,6 @@ bool explicit_acl_equal(PACL left, PACL right) {
             return false;
         }
     }
-}
-
-std::vector<std::byte> current_descriptor(const HANDLE handle) {
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    const DWORD status = GetSecurityInfo(handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-                                         nullptr, nullptr, nullptr, nullptr, &descriptor);
-    if (status != ERROR_SUCCESS) throw_win32(status);
-    LocalMemory memory(descriptor);
-    const DWORD length = GetSecurityDescriptorLength(descriptor);
-    if (length == 0 || length > max_state) {
-        throw std::runtime_error("invalid current security descriptor length");
-    }
-    std::vector<std::byte> bytes(length);
-    std::memcpy(bytes.data(), descriptor, length);
-    static_cast<void>(descriptor_parts(bytes));
-    return bytes;
 }
 
 bool dacl_state_matches(PACL expected, const SECURITY_DESCRIPTOR_CONTROL expected_control,
@@ -852,11 +820,8 @@ void write_state(const fs::path& path, const std::span<const Backup> backups,
 std::vector<RecoveryEntry> read_state(const fs::path& path) {
     UniqueHandle file = elevation::open_file(path, GENERIC_READ | READ_CONTROL | WRITE_DAC,
                                                0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT);
-    BY_HANDLE_FILE_INFORMATION information{};
-    if (!GetFileInformationByHandle(file.get(), &information)) throw_win32(GetLastError());
-    if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
-        throw std::runtime_error("recovery state is not a regular, non-reparse file");
-    }
+    static_cast<void>(inspect_regular_file(
+        file.get(), false, "recovery state is not a regular, non-reparse file"));
     UserIdentity identity = current_user();
     require_current_user_owner(file.get(), identity.sid, identity.owner_sid);
     RestrictedSecurity security(identity.sid, 0);
@@ -866,7 +831,7 @@ std::vector<RecoveryEntry> read_state(const fs::path& path) {
         nullptr, nullptr, security.acl(), nullptr);
     if (acl_status != ERROR_SUCCESS) throw_win32(acl_status);
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file.get(), &size)) throw_win32(GetLastError());
+    if (!GetFileSizeEx(file.get(), &size)) throw_win32();
     if (size.QuadPart < 0 || static_cast<std::uint64_t>(size.QuadPart) > max_state_file) {
         throw std::runtime_error("recovery file is too large");
     }
@@ -877,7 +842,7 @@ std::vector<RecoveryEntry> read_state(const fs::path& path) {
             std::min<size_t>(data.size() - offset, MAXDWORD));
         DWORD read = 0;
         if (!ReadFile(file.get(), data.data() + offset, requested, &read, nullptr)) {
-            throw_win32(GetLastError());
+            throw_win32();
         }
         if (read == 0) throw std::runtime_error("could not read complete recovery file");
         offset += read;
@@ -887,7 +852,8 @@ std::vector<RecoveryEntry> read_state(const fs::path& path) {
 
 AppError protection_error(const char* stage, const std::exception& error) {
     if (dynamic_cast<const elevation::Cancelled*>(&error) != nullptr) throw elevation::Cancelled();
-    return AppError(ExitCode::overlay_protection, stage, error.what());
+    return AppError(ExitCode::overlay_protection, stage, error.what())
+        .with_guidance(i18n::text(i18n::Msg::overlay_protection_guidance));
 }
 
 void remove_incomplete_state(const fs::path& path, const Logger& log) {
@@ -914,10 +880,11 @@ void remove_incomplete_state(const fs::path& path, const Logger& log) {
 struct PreparedRecovery {
     const RecoveryEntry* entry;
     OpenedTarget observed;
-    OpenedTarget writable;
+    OpenedTarget target;
 };
 
 std::optional<PreparedRecovery> prepare_recovery_entry(const RecoveryEntry& entry,
+                                                       const DWORD extra_access,
                                                        const Logger& log) {
     const std::string shown = display_path(entry.backup.path);
     std::optional<OpenedTarget> observed;
@@ -927,7 +894,7 @@ std::optional<PreparedRecovery> prepare_recovery_entry(const RecoveryEntry& entr
         log.warn("skipped ACL recovery for unsafe renderer target: " + shown + ": " + error.what());
         return std::nullopt;
     } catch (const std::system_error& error) {
-        if (missing_error(static_cast<DWORD>(error.code().value()))) {
+        if (is_missing_error(static_cast<DWORD>(error.code().value()))) {
             log.warn("skipped ACL recovery for missing renderer: " + shown);
             return std::nullopt;
         }
@@ -941,13 +908,72 @@ std::optional<PreparedRecovery> prepare_recovery_entry(const RecoveryEntry& entr
         log.warn("skipped ACL recovery because steam.exe is missing or unsafe: " + shown);
         return std::nullopt;
     }
-    OpenedTarget writable = open_target(
-        entry.backup.path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES);
-    if (writable.identity != entry.identity || writable.identity != observed->identity) {
+    OpenedTarget target = open_target(
+        entry.backup.path, extra_access | READ_CONTROL | FILE_READ_ATTRIBUTES);
+    if (target.identity != entry.identity || target.identity != observed->identity) {
         throw std::runtime_error("renderer identity changed while ACL recovery was opening it: " + shown);
     }
-    static_cast<void>(restoration_state(entry.backup, writable.handle.get()));
-    return PreparedRecovery{&entry, std::move(*observed), std::move(writable)};
+    static_cast<void>(restoration_state(entry.backup, target.handle.get()));
+    return PreparedRecovery{&entry, std::move(*observed), std::move(target)};
+}
+
+void match_recovery_entries(const std::vector<RecoveryEntry>& entries,
+                            const std::vector<fs::path>& targets, const DWORD extra_access,
+                            const Logger& log, std::vector<Backup>* backups,
+                            std::vector<UniqueHandle>* handles) {
+    if (entries.size() != targets.size()) {
+        throw std::runtime_error(
+            "saved renderer set does not match the selected Steam renderer files; "
+            "original recovery backup was preserved");
+    }
+    std::vector<bool> matched(entries.size(), false);
+    for (const fs::path& target : targets) {
+        size_t match = entries.size();
+        for (size_t index = 0; index < entries.size(); ++index) {
+            if (!paths::equal_windows(target, entries[index].backup.path)) continue;
+            if (matched[index] || match != entries.size()) {
+                throw std::runtime_error("saved renderer set contains duplicate targets");
+            }
+            match = index;
+        }
+        if (match == entries.size()) {
+            throw std::runtime_error("selected renderer is missing from the original "
+                                     "recovery backup: " + display_path(target));
+        }
+        try {
+            std::optional<PreparedRecovery> prepared =
+                prepare_recovery_entry(entries[match], extra_access, log);
+            if (!prepared) {
+                throw std::runtime_error("renderer could not be safely matched to its "
+                                         "original recovery backup");
+            }
+            matched[match] = true;
+            if (backups != nullptr) backups->push_back(entries[match].backup);
+            if (handles != nullptr) handles->push_back(std::move(prepared->target.handle));
+        } catch (const elevation::Cancelled&) {
+            throw;
+        } catch (const std::exception& error) {
+            throw std::runtime_error(display_path(target) + ": " + error.what());
+        }
+    }
+}
+
+void prepare_resumed_backups(const std::vector<fs::path>& targets, const fs::path& state_path,
+                             const Logger& log, std::vector<Backup>& backups,
+                             std::vector<UniqueHandle>& handles) {
+    const std::vector<RecoveryEntry> entries = read_state(state_path);
+    match_recovery_entries(entries, targets, WRITE_DAC, log, &backups, &handles);
+}
+
+void prepare_fresh_backups(const std::vector<fs::path>& targets, std::vector<Backup>& backups,
+                           std::vector<UniqueHandle>& handles,
+                           std::vector<FileIdentity>& identities) {
+    for (const fs::path& target : targets) {
+        OpenBackup opened = make_backup(target);
+        backups.push_back(std::move(opened.backup));
+        handles.push_back(std::move(opened.handle));
+        identities.push_back(opened.identity);
+    }
 }
 
 } // namespace
@@ -956,50 +982,61 @@ fs::path recovery_path(const fs::path& game_directory) {
     return game_directory / L"steamfix.dat";
 }
 
-bool recover_pending(const fs::path& path, const Logger& log) {
-    remove_incomplete_state(path, log);
+RecoveryInspection inspect_recovery(const std::vector<fs::path>& targets,
+                                    const fs::path& state_path, const Logger& log) {
     std::error_code error;
-    const bool state_exists = fs::exists(path, error);
+    const bool exists = fs::exists(state_path, error);
     if (error) {
-        throw protection_error("ACL recovery",
-                               fs::filesystem_error("inspect recovery file", path, error));
+        throw AppError(ExitCode::overlay_protection, "ACL recovery lookup", error.message())
+            .with_guidance(i18n::text(i18n::Msg::overlay_protection_guidance));
     }
-    if (!state_exists) return false;
+    if (!exists) return {RecoveryStatus::absent, {}, {}};
+
+    std::vector<RecoveryEntry> entries;
     try {
-        const std::vector<RecoveryEntry> entries = read_state(path);
-        log.warn("found pending ACL recovery state with " +
-                  std::to_string(entries.size()) + " entries");
-        std::vector<PreparedRecovery> prepared;
-        prepared.reserve(entries.size());
-        size_t skipped = 0;
-        for (const RecoveryEntry& entry : entries) {
-            std::optional<PreparedRecovery> target = prepare_recovery_entry(entry, log);
-            if (target) {
-                prepared.push_back(std::move(*target));
-            } else {
-                ++skipped;
-            }
-        }
-        if (skipped != 0) {
-            log.warn("preflighted renderer permission recovery state: prepared=" +
-                     std::to_string(prepared.size()) + ", skipped=" + std::to_string(skipped) +
-                     "; recovery state preserved");
-            throw std::runtime_error(
-                "one or more renderer files could not be safely matched; recovery state was preserved");
-        }
-        size_t restored = 0;
-        for (const PreparedRecovery& target : prepared) {
-            if (restore_one(target.entry->backup, target.writable.handle.get())) ++restored;
-        }
-        const bool removed = elevation::remove_recovery_file(path);
-        if (!removed) throw std::runtime_error("recovery file disappeared before cleanup");
-        log.info("processed renderer permission recovery state: restored=" +
-                 std::to_string(restored) + ", skipped=" + std::to_string(skipped));
-        return true;
-    } catch (const AppError&) {
+        entries = read_state(state_path);
+    } catch (const elevation::Cancelled&) {
         throw;
-    } catch (const std::exception& exception) {
-        throw protection_error("ACL recovery", exception);
+    } catch (const std::exception& read_error) {
+        return {RecoveryStatus::unusable, read_error.what(), {}};
+    }
+
+    std::vector<fs::path> saved_paths;
+    saved_paths.reserve(entries.size());
+    for (const RecoveryEntry& entry : entries) saved_paths.push_back(entry.backup.path);
+
+    try {
+        match_recovery_entries(entries, targets, 0, log, nullptr, nullptr);
+    } catch (const elevation::Cancelled&) {
+        throw;
+    } catch (const std::exception& match_error) {
+        return {RecoveryStatus::unusable, match_error.what(), std::move(saved_paths)};
+    }
+
+    return {RecoveryStatus::reusable, {}, std::move(saved_paths)};
+}
+
+bool any_has_current_user_execute_deny(const std::vector<fs::path>& paths) {
+    const UserIdentity identity = current_user();
+    for (const fs::path& path : paths) {
+        try {
+            const OpenedTarget opened = open_target(path, READ_CONTROL | FILE_READ_ATTRIBUTES);
+            const std::vector<std::byte> descriptor = current_descriptor(opened.handle.get());
+            if (has_current_user_execute_deny(descriptor, identity.sid)) return true;
+        } catch (const std::system_error& error) {
+            if (is_missing_error(static_cast<DWORD>(error.code().value()))) continue;
+            throw;
+        }
+    }
+    return false;
+}
+
+void remove_stale_recovery(const fs::path& state_path, const Logger& log) {
+    remove_incomplete_state(state_path, log);
+    try {
+        static_cast<void>(elevation::remove_recovery_file(state_path));
+    } catch (const std::exception& error) {
+        throw protection_error("ACL recovery cleanup", error);
     }
 }
 
@@ -1007,7 +1044,8 @@ Protection Protection::apply(const std::vector<fs::path>& targets, fs::path stat
                              const Logger& log) {
     if (targets.empty() || targets.size() > max_entries) {
         throw AppError(ExitCode::overlay_protection, "ACL backup",
-                       "expected one or two renderer targets");
+                       "expected one or two renderer targets")
+            .with_guidance(i18n::text(i18n::Msg::overlay_protection_guidance));
     }
     std::vector<Backup> backups;
     std::vector<UniqueHandle> handles;
@@ -1019,49 +1057,9 @@ Protection Protection::apply(const std::vector<fs::path>& targets, fs::path stat
         identities.reserve(targets.size());
         resuming = fs::exists(state_path);
         if (resuming) {
-            std::vector<RecoveryEntry> entries = read_state(state_path);
-            if (entries.size() != targets.size()) {
-                throw std::runtime_error(
-                    "saved renderer set does not match the selected Steam renderer files; "
-                    "original recovery backup was preserved");
-            }
-            std::vector<bool> matched(entries.size(), false);
-            for (const fs::path& target : targets) {
-                size_t match = entries.size();
-                for (size_t index = 0; index < entries.size(); ++index) {
-                    if (!paths::equal_windows(target, entries[index].backup.path)) continue;
-                    if (matched[index] || match != entries.size()) {
-                        throw std::runtime_error("saved renderer set contains duplicate targets");
-                    }
-                    match = index;
-                }
-                if (match == entries.size()) {
-                    throw std::runtime_error("selected renderer is missing from the original "
-                                             "recovery backup: " + display_path(target));
-                }
-                try {
-                    std::optional<PreparedRecovery> prepared =
-                        prepare_recovery_entry(entries[match], log);
-                    if (!prepared) {
-                        throw std::runtime_error("renderer could not be safely matched to its "
-                                                 "original recovery backup");
-                    }
-                    matched[match] = true;
-                    backups.push_back(entries[match].backup);
-                    handles.push_back(std::move(prepared->writable.handle));
-                } catch (const elevation::Cancelled&) {
-                    throw;
-                } catch (const std::exception& error) {
-                    throw std::runtime_error(display_path(target) + ": " + error.what());
-                }
-            }
+            prepare_resumed_backups(targets, state_path, log, backups, handles);
         } else {
-            for (const fs::path& target : targets) {
-                OpenBackup opened = make_backup(target);
-                backups.push_back(std::move(opened.backup));
-                handles.push_back(std::move(opened.handle));
-                identities.push_back(opened.identity);
-            }
+            prepare_fresh_backups(targets, backups, handles, identities);
         }
     } catch (const std::exception& error) {
         throw protection_error(resuming ? "ACL recovery validation" : "ACL backup", error);
@@ -1076,7 +1074,7 @@ Protection Protection::apply(const std::vector<fs::path>& targets, fs::path stat
     try {
         if (!resuming) {
             for (Backup& backup : backups) {
-                if (has_current_user_execute_deny(backup, identity.sid)) {
+                if (has_current_user_execute_deny(backup.descriptor, identity.sid)) {
                     throw std::runtime_error(
                         "current-user execute access is already denied but no matching recovery "
                         "backup was found; preserve any existing steamfix.dat files: " +
@@ -1121,7 +1119,8 @@ Protection Protection::apply(const std::vector<fs::path>& targets, fs::path stat
                 try { elevation::remove_recovery_file(state_path); } catch (...) {}
             }
             throw AppError(ExitCode::overlay_protection, "renderer permission denial",
-                           display_path(backups[index].path) + ": " + error.what());
+                           display_path(backups[index].path) + ": " + error.what())
+                .with_guidance(i18n::text(i18n::Msg::overlay_protection_guidance));
         }
     }
     return Protection(std::move(backups), std::move(handles), std::move(state_path));

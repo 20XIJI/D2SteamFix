@@ -38,7 +38,7 @@ struct Invocation {
 
 bool validate_app_ids(const std::optional<std::wstring>& app_id,
                       const std::optional<std::wstring>& game_id) noexcept;
-Invocation validate_invocation(const std::vector<std::wstring>& args,
+Invocation validate_invocation(const fs::path& launcher, const std::vector<std::wstring>& args,
                                const std::optional<std::wstring>& app_id,
                                const std::optional<std::wstring>& game_id);
 
@@ -71,21 +71,11 @@ std::wstring optional_id(const std::optional<std::wstring>& value) {
 std::vector<std::wstring> command_line_arguments() {
     int count = 0;
     LPWSTR* raw = CommandLineToArgvW(GetCommandLineW(), &count);
-    if (raw == nullptr) throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
+    if (raw == nullptr) throw_win32();
     const std::unique_ptr<wchar_t*, decltype(&LocalFree)> guard(raw, &LocalFree);
     std::vector<std::wstring> result;
     for (int index = 1; index < count; ++index) result.emplace_back(raw[index]);
     return result;
-}
-
-fs::path current_executable() {
-    std::wstring buffer(32768, L'\0');
-    const DWORD written = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-    if (written == 0 || written >= buffer.size()) {
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
-    }
-    buffer.resize(written);
-    return fs::path(buffer);
 }
 
 class SessionMutex final {
@@ -100,7 +90,7 @@ private:
 
 SessionMutex session_mutex() {
     SetLastError(ERROR_SUCCESS);
-    HANDLE raw = CreateMutexW(nullptr, TRUE, L"Global\\D2SteamFix-1085660");
+    HANDLE raw = CreateMutexW(nullptr, TRUE, constants::session_mutex_name);
     if (raw == nullptr) {
         throw AppError(ExitCode::existing_session, "single-instance check", windows_error());
     }
@@ -108,7 +98,8 @@ SessionMutex session_mutex() {
     UniqueHandle handle(raw);
     if (already_exists) {
         throw AppError(ExitCode::existing_session, "single-instance check",
-                       "another D2SteamFix session is already active on this computer");
+                       "another D2SteamFix session is already active on this computer")
+            .with_guidance(i18n::text(i18n::Msg::session_already_active));
     }
     return SessionMutex(std::move(handle));
 }
@@ -173,10 +164,14 @@ ChildProcess launch(const Invocation& invocation, const fs::path& steam_director
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION information{};
-    bool created = elevation::launch_as_desktop_user(invocation.launcher, command_line,
+    const bool intentionally_elevated = elevation::inherited_steam_directory().has_value();
+    bool created = false;
+    if (!intentionally_elevated) {
+        created = elevation::launch_as_desktop_user(invocation.launcher, command_line,
                                                     invocation.game_dir, information);
+    }
     if (!created) {
-        if (elevation::is_elevated()) {
+        if (!intentionally_elevated && elevation::is_elevated()) {
             log.warn("desktop-user launch unavailable; launching from the existing administrator context");
         }
         created = CreateProcessW(invocation.launcher.c_str(), command_line.data(), nullptr, nullptr,
@@ -211,12 +206,63 @@ std::string existing_processes(const std::vector<std::pair<DWORD, std::wstring>>
     return output.str();
 }
 
-int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs::path& recovery) {
+std::vector<fs::path> discover_renderers(const fs::path& steam_directory, const Logger& log) {
+    const fs::path renderer64 = steam_directory / constants::renderer64_name;
+    try {
+        require_regular_file(renderer64, ExitCode::steam_discovery, "renderer discovery",
+                             "GameOverlayRenderer64.dll is missing or is not a regular file");
+    } catch (AppError& error) {
+        error.with_guidance(i18n::text(i18n::Msg::steam_discovery_guidance));
+        throw;
+    }
+    std::vector<fs::path> targets{renderer64};
+    log.info("selected renderer DLL: " + display_path(renderer64));
+    const fs::path renderer32 = steam_directory / constants::renderer32_name;
+    std::error_code renderer32_error;
+    const bool renderer32_exists = fs::is_regular_file(renderer32, renderer32_error);
+    if (renderer32_error) {
+        throw AppError(ExitCode::steam_discovery, "renderer discovery",
+                       display_path(renderer32) + ": " + renderer32_error.message())
+            .with_guidance(i18n::text(i18n::Msg::steam_discovery_guidance));
+    }
+    if (renderer32_exists) {
+        log.info("selected renderer DLL: " + display_path(renderer32));
+        targets.push_back(renderer32);
+    } else {
+        log.warn("optional GameOverlayRenderer.dll is absent");
+    }
+    return targets;
+}
+
+[[noreturn]] void rethrow_session_error(const std::exception_ptr& session_error,
+                                        const bool launcher_started) {
+    try {
+        std::rethrow_exception(session_error);
+    } catch (const elevation::Cancelled&) {
+        throw;
+    } catch (const elevation::RelaunchRequired&) {
+        throw;
+    } catch (AppError& error) {
+        if (launcher_started) error.after_launch();
+        throw;
+    } catch (const std::exception& error) {
+        AppError converted(ExitCode::internal, "post-launch session", error.what());
+        if (launcher_started) converted.after_launch();
+        throw converted;
+    } catch (...) {
+        AppError converted(ExitCode::internal, "post-launch session", "unknown exception");
+        if (launcher_started) converted.after_launch();
+        throw converted;
+    }
+}
+
+int run(const Logger& log, const fs::path& resolved_launcher,
+        const std::vector<std::wstring>& forwarded, const fs::path& recovery) {
     const std::optional<std::wstring> app_id = environment(L"SteamAppId");
     const std::optional<std::wstring> game_id = environment(L"SteamGameId");
     log.info(narrow(L"inherited App IDs: SteamAppId=" + optional_id(app_id) +
                     L", SteamGameId=" + optional_id(game_id)));
-    const Invocation invocation = validate_invocation(forwarded, app_id, game_id);
+    const Invocation invocation = validate_invocation(resolved_launcher, forwarded, app_id, game_id);
     log.info("validated launcher path: " + display_path(invocation.launcher));
     log.info("relevant App ID: 1085660");
     fs::path steam_directory;
@@ -227,19 +273,10 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
             steam_directory = steam::discover();
         }
     } catch (const std::exception& error) {
-        throw AppError(ExitCode::steam_discovery, "Steam discovery", error.what());
+        throw AppError(ExitCode::steam_discovery, "Steam discovery", error.what())
+            .with_guidance(i18n::text(i18n::Msg::steam_discovery_guidance));
     }
     log.info("Steam directory: " + display_path(steam_directory));
-    std::error_code recovery_error;
-    const bool has_recovery = fs::exists(recovery, recovery_error);
-    if (recovery_error) {
-        throw AppError(ExitCode::overlay_protection, "ACL recovery lookup", recovery_error.message());
-    }
-    if (!has_recovery && repair::needed(steam_directory, log)) {
-        log.warn("renderer execute access is blocked without a recovery backup; offering Steam repair");
-        static_cast<void>(repair::run(invocation.game_dir, recovery, log));
-        return 0;
-    }
     check_overlay(OverlayCheck::advisory, log);
     std::vector<std::pair<DWORD, std::wstring>> existing;
     try {
@@ -251,23 +288,45 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
         throw AppError(ExitCode::existing_session, "existing-session check", existing_processes(existing))
             .with_guidance(i18n::text(i18n::Msg::destiny_running));
     }
-    const fs::path renderer64 = steam_directory / L"GameOverlayRenderer64.dll";
-    require_regular_file(renderer64, ExitCode::steam_discovery, "renderer discovery",
-                         "GameOverlayRenderer64.dll is missing or is not a regular file");
-    std::vector<fs::path> targets{renderer64};
-    log.info("selected renderer DLL: " + display_path(renderer64));
-    const fs::path renderer32 = steam_directory / L"GameOverlayRenderer.dll";
-    std::error_code renderer32_error;
-    const bool renderer32_exists = fs::is_regular_file(renderer32, renderer32_error);
-    if (renderer32_error) {
-        throw AppError(ExitCode::steam_discovery, "renderer discovery",
-                       display_path(renderer32) + ": " + renderer32_error.message());
-    }
-    if (renderer32_exists) {
-        log.info("selected renderer DLL: " + display_path(renderer32));
-        targets.push_back(renderer32);
-    } else {
-        log.warn("optional GameOverlayRenderer.dll is absent");
+    const std::vector<fs::path> targets = discover_renderers(steam_directory, log);
+
+    const acl::RecoveryInspection inspection = acl::inspect_recovery(targets, recovery, log);
+    if (inspection.status == acl::RecoveryStatus::absent) {
+        if (repair::needed(steam_directory, log)) {
+            log.warn("renderer execute access is blocked without a recovery backup; offering Steam repair");
+            static_cast<void>(repair::run(invocation.game_dir, recovery,
+                                          repair::Trigger::blocked_without_backup, log));
+            return 0;
+        }
+    } else if (inspection.status == acl::RecoveryStatus::unusable) {
+        bool healthy = false;
+        try {
+            const bool live_blocked = repair::needed(steam_directory, log) ||
+                                      acl::any_has_current_user_execute_deny(targets);
+            const bool saved_blocked =
+                !inspection.saved_paths.empty() &&
+                (repair::any_execute_blocked(inspection.saved_paths, log) ||
+                 acl::any_has_current_user_execute_deny(inspection.saved_paths));
+            healthy = !live_blocked && !saved_blocked;
+        } catch (const elevation::Cancelled&) {
+            throw;
+        } catch (const std::exception& error) {
+            log.warn("could not verify renderer permissions while inspecting stale recovery state: " +
+                     std::string(error.what()));
+            healthy = false;
+        }
+        if (healthy) {
+            log.warn("existing steamfix.dat could not be reused (" + inspection.reason +
+                     "); live renderer permissions are verified healthy, removing stale recovery state");
+            acl::remove_stale_recovery(recovery, log);
+        } else {
+            log.warn("existing steamfix.dat could not be reused (" + inspection.reason +
+                     ") while renderer execute access is blocked or unverifiable; preserving "
+                     "recovery state and offering Steam repair");
+            static_cast<void>(repair::run(invocation.game_dir, recovery,
+                                          repair::Trigger::unusable_backup_blocked, log));
+            return 0;
+        }
     }
 
     acl::Protection protection = acl::Protection::apply(targets, recovery, log);
@@ -299,29 +358,15 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
             }
         }
         AppError combined(ExitCode::overlay_protection, cleanup_error.stage(), std::move(detail));
+        if (!cleanup_error.guidance().empty()) {
+            combined.with_guidance(cleanup_error.guidance());
+        } else {
+            combined.with_guidance(i18n::text(i18n::Msg::overlay_protection_guidance));
+        }
         if (launcher_started) combined.after_launch();
         throw combined;
     }
-    if (session_error) {
-        try {
-            std::rethrow_exception(session_error);
-        } catch (const elevation::Cancelled&) {
-            throw;
-        } catch (const elevation::RelaunchRequired&) {
-            throw;
-        } catch (AppError& error) {
-            if (launcher_started) error.after_launch();
-            throw;
-        } catch (const std::exception& error) {
-            AppError converted(ExitCode::internal, "post-launch session", error.what());
-            if (launcher_started) converted.after_launch();
-            throw converted;
-        } catch (...) {
-            AppError converted(ExitCode::internal, "post-launch session", "unknown exception");
-            if (launcher_started) converted.after_launch();
-            throw converted;
-        }
-    }
+    if (session_error) rethrow_session_error(session_error, launcher_started);
     if (exit_status) {
         log.info("original launcher exit status: " + std::to_string(*exit_status));
     } else {
@@ -331,12 +376,15 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
     return exit_status.value_or(0);
 }
 
+std::wstring error_code_suffix(const ExitCode code) {
+    return i18n::text(i18n::Msg::error_code) + std::to_wstring(static_cast<int>(code));
+}
+
 std::wstring failure_message(const AppError& error) {
     // The exit code is what docs/EXIT_CODES.md is indexed by, and what makes a user report
     // identifiable; show it even when the rest of the text is friendly guidance.
-    const std::wstring code_line =
-        i18n::text(i18n::Msg::error_code) + std::to_wstring(static_cast<int>(error.code()));
-    if (error.stage() == "Steam file repair") {
+    const std::wstring code_line = error_code_suffix(error.code());
+    if (error.is_repair_failure()) {
         return i18n::text(i18n::Msg::repair_failure_intro) + widen(error.detail()) +
                i18n::text(i18n::Msg::see_log_only) + code_line;
     }
@@ -381,15 +429,9 @@ fs::path resolve_launcher(const std::wstring& argument) {
     return launcher;
 }
 
-Invocation validate_invocation(const std::vector<std::wstring>& args,
+Invocation validate_invocation(const fs::path& launcher, const std::vector<std::wstring>& args,
                                const std::optional<std::wstring>& app_id,
                                const std::optional<std::wstring>& game_id) {
-    if (args.empty()) {
-        throw AppError(ExitCode::invalid_invocation, "invalid invocation",
-                       "no Destiny 2 command was forwarded")
-            .with_guidance(i18n::text(i18n::Msg::invalid_invocation));
-    }
-    const fs::path launcher = resolve_launcher(args.front());
     const fs::path game_dir = launcher.parent_path();
     if (game_dir.empty()) {
         throw AppError(ExitCode::validation, "command validation", "launcher has no containing directory");
@@ -399,7 +441,8 @@ Invocation validate_invocation(const std::vector<std::wstring>& args,
                          "destiny2.exe is not a regular file beside the launcher");
     if (!validate_app_ids(app_id, game_id)) {
         throw AppError(ExitCode::validation, "Steam App ID validation",
-                       "SteamAppId and SteamGameId must be absent or 1085660, and at least one must equal 1085660");
+                       "SteamAppId and SteamGameId must be absent or 1085660, and at least one must equal 1085660")
+            .with_guidance(i18n::text(i18n::Msg::wrong_steam_app_id));
     }
     return {launcher, game_dir, std::vector<std::wstring>(args.begin() + 1, args.end())};
 }
@@ -413,27 +456,34 @@ int entry() {
         if (const std::optional<int> helper = elevation::dispatch_helper(forwarded)) return *helper;
         elevation::accept_elevated_launch(forwarded);
     } catch (const std::exception& error) {
-        ui::error(i18n::text(i18n::Msg::command_line_failure) + widen(error.what()));
+        ui::error(i18n::text(i18n::Msg::command_line_failure) + widen(error.what()) +
+                  error_code_suffix(ExitCode::invalid_invocation));
         return static_cast<int>(ExitCode::invalid_invocation);
     }
     fs::path executable;
     try {
-        executable = current_executable();
+        executable = process::current_executable();
     } catch (const std::exception& error) {
         ui::error(i18n::text(i18n::Msg::executable_path_failure) + widen(error.what()) + L"\n\n" +
-                  i18n::text(i18n::Msg::game_not_started));
+                  i18n::text(i18n::Msg::game_not_started) + error_code_suffix(ExitCode::internal));
         return static_cast<int>(ExitCode::internal);
     }
+    std::optional<fs::path> resolved_launcher;
     fs::path game_directory;
     try {
-        game_directory = forwarded.empty() ? executable.parent_path()
-                                            : resolve_launcher(forwarded.front()).parent_path();
+        if (forwarded.empty()) {
+            game_directory = fs::canonical(executable.parent_path());
+        } else {
+            resolved_launcher = resolve_launcher(forwarded.front());
+            game_directory = resolved_launcher->parent_path();
+        }
     } catch (const AppError& error) {
         ui::error(failure_message(error));
         return static_cast<int>(error.code());
     } catch (const std::exception& error) {
         ui::error(i18n::text(i18n::Msg::game_directory_failure) + widen(error.what()) + L"\n\n" +
-                  i18n::text(i18n::Msg::game_not_started));
+                  i18n::text(i18n::Msg::game_not_started) +
+                  error_code_suffix(ExitCode::log_initialization));
         return static_cast<int>(ExitCode::log_initialization);
     }
     std::unique_ptr<Logger> log;
@@ -443,7 +493,8 @@ int entry() {
         return 0;
     } catch (const std::exception& error) {
         ui::error(i18n::text(i18n::Msg::log_open_failure) + widen(error.what()) + L"\n\n" +
-                  i18n::text(i18n::Msg::game_not_started));
+                  i18n::text(i18n::Msg::game_not_started) +
+                  error_code_suffix(ExitCode::log_initialization));
         return static_cast<int>(ExitCode::log_initialization);
     }
     log->info("startup; wrapper path: " + display_path(executable) +
@@ -452,12 +503,13 @@ int entry() {
         const fs::path recovery = acl::recovery_path(game_directory);
         log->info("ACL recovery state path: " + display_path(recovery));
         if (forwarded.empty()) {
-            static_cast<void>(repair::run(game_directory, recovery, *log));
+            static_cast<void>(repair::run(game_directory, recovery,
+                                          repair::Trigger::direct_launch, *log));
             log->info("direct Steam repair finished; final exit status: 0");
             return 0;
         }
         const SessionMutex mutex = session_mutex();
-        const int code = run(*log, forwarded, recovery);
+        const int code = run(*log, *resolved_launcher, forwarded, recovery);
         log->info("final exit status: " + std::to_string(code));
         return code;
     } catch (const elevation::RelaunchRequired& request) {
@@ -481,7 +533,8 @@ int entry() {
         } catch (const std::exception& error) {
             log->error("administrator session launch or monitoring failed: " + std::string(error.what()));
             ui::error(i18n::text(i18n::Msg::admin_session_failure_intro) + widen(error.what()) +
-                      i18n::text(i18n::Msg::admin_session_failure_outro));
+                      i18n::text(i18n::Msg::admin_session_failure_outro) +
+                      error_code_suffix(ExitCode::process_creation));
             return static_cast<int>(ExitCode::process_creation);
         }
     } catch (const elevation::Cancelled&) {
@@ -495,12 +548,12 @@ int entry() {
     } catch (const std::exception& error) {
         log->error("unexpected internal failure: " + std::string(error.what()) + "; helper exit code=19");
         ui::error(i18n::text(i18n::Msg::internal_failure) + i18n::text(i18n::Msg::see_log) +
-                  i18n::text(i18n::Msg::game_not_started));
+                  i18n::text(i18n::Msg::game_not_started) + error_code_suffix(ExitCode::internal));
         return static_cast<int>(ExitCode::internal);
     } catch (...) {
         log->error("unexpected internal failure; helper exit code=19");
         ui::error(i18n::text(i18n::Msg::internal_failure) + i18n::text(i18n::Msg::see_log) +
-                  i18n::text(i18n::Msg::game_not_started));
+                  i18n::text(i18n::Msg::game_not_started) + error_code_suffix(ExitCode::internal));
         return static_cast<int>(ExitCode::internal);
     }
 }
